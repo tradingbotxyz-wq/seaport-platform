@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useApi, post, put, money, dateShort, dateTime, download, addBusinessDaysIso } from '../lib.js';
+import { useApi, post, put, money, dateShort, dateTime, download, addBusinessDaysIso, doneMessage, isPending } from '../lib.js';
 import { useSession } from '../session.js';
 import { Card, Kpi, Field, Button, Pill, Modal, ErrorBox, Loading, Empty, Icon, useUi, useAction } from '../ui.jsx';
 
@@ -56,7 +56,7 @@ export default function Disbursements() {
                 <td><input type="checkbox" className="check" checked={checked.has(p.id)} onChange={() => setChecked((s) => { const n = new Set(s); if (n.has(p.id)) n.delete(p.id); else n.add(p.id); return n; })} aria-label={`Select payment to ${p.beneficiary_name}`} /></td>
                 <td><Pill tone={p.purpose === 'FUNDING' ? 'info' : 'violet'}>{p.purpose === 'FUNDING' ? 'Seller funding' : 'Distribution'}</Pill></td>
                 <td className="strong">{p.account_name ?? p.beneficiary_name}</td><td>{p.bank_name ?? <span className="t-red">No account on file</span>}</td>
-                <td className="mono">{p.iban_masked ?? (p.routing_number ? `${p.routing_number} / ${p.account_number_masked}` : '—')}</td>
+                <td className="mono">{p.iban_masked ?? (p.account_number_masked ? `${p.routing_number_masked} / ${p.account_number_masked}` : "—")}</td>
                 <td className="r">{money(p.amount_cents, p.currency)}</td><td>{dateShort(p.due_date)}</td><td className="small muted">{p.reference}</td>
               </tr>
             ))}</tbody>
@@ -83,7 +83,7 @@ export default function Disbursements() {
           <div className="table-wrap"><table className="tbl">
             <thead><tr><th>Owner</th><th>Account name</th><th>Bank</th><th>Routing / BIC</th><th>Account / IBAN</th><th>Ccy</th><th>Country</th><th>Changed by</th><th /></tr></thead>
             <tbody>{accounts.data.map((a) => (
-              <tr key={a.id} className={a.active ? '' : 'dim'}><td>{a.owner_name}</td><td className="strong">{a.account_name}</td><td>{a.bank_name}</td><td className="mono">{a.routing_number ?? a.bic}</td>
+              <tr key={a.id} className={a.active ? '' : 'dim'}><td>{a.owner_name}</td><td className="strong">{a.account_name}</td><td>{a.bank_name}</td><td className="mono">{a.routing_number_masked ?? a.bic}</td>
                 <td className="mono">{a.iban_masked ?? a.account_number_masked}</td><td>{a.currency}</td><td>{a.country}</td><td>{a.updated_by} · {dateShort(a.updated_at)}</td>
                 <td>{can('payments.accounts') && <Button size="sm" icon="edit" onClick={() => setEditAcct(a)}>Edit</Button>}</td></tr>
             ))}</tbody>
@@ -121,7 +121,7 @@ function BatchModal({ id, onClose, onChanged }) {
           <div className="row" style={{ marginBottom: 12 }}><Pill tone={STATUS_TONE[b.status]}>{b.status}</Pill>{b.approved_by && <span className="small muted">Approved by {b.approved_by} · {dateTime(b.approved_at)}</span>}{b.sent_at && <span className="small muted">Sent {dateTime(b.sent_at)}</span>}</div>
           <div className="table-wrap"><table className="tbl">
             <thead><tr><th>Beneficiary</th><th>Bank</th><th>Account</th><th className="r">Amount</th><th>Reference</th><th>Status</th></tr></thead>
-            <tbody>{b.payments.map((p) => <tr key={p.id}><td className="strong">{p.account_name}</td><td>{p.bank_name}</td><td className="mono">{p.iban_masked ?? `${p.routing_number} / ${p.account_number_masked}`}</td><td className="r">{money(p.amount_cents, p.currency)}</td><td className="small">{p.reference}</td><td><Pill status={p.status === 'SENT' ? 'SETTLED' : 'OPEN'}>{p.status}</Pill></td></tr>)}</tbody>
+            <tbody>{b.payments.map((p) => <tr key={p.id}><td className="strong">{p.account_name}</td><td>{p.bank_name}</td><td className="mono">{p.iban_masked ?? `${p.routing_number_masked} / ${p.account_number_masked}`}</td><td className="r">{money(p.amount_cents, p.currency)}</td><td className="small">{p.reference}</td><td><Pill status={p.status === 'SENT' ? 'SETTLED' : 'OPEN'}>{p.status}</Pill></td></tr>)}</tbody>
             <tfoot><tr><td colSpan={3}>{b.payments.length} payments</td><td className="r">{money(b.payments.reduce((a, p) => a + p.amount_cents, 0), b.currency)}</td><td colSpan={2} /></tr></tfoot>
           </table></div>
           {preview.data && (
@@ -153,20 +153,20 @@ function AccountModal({ account, onClose, onDone }) {
   const investors = useApi('/api/investors');
   const a = account ?? {};
   const [f, setF] = useState({ owner_type: a.owner_type ?? 'PROGRAM', owner_id: a.owner_id ? String(a.owner_id) : '', account_name: a.account_name ?? '', bank_name: a.bank_name ?? '',
-    routing_number: a.routing_number ?? '', account_number: '', bic: a.bic ?? '', iban: '', currency: a.currency ?? 'USD', country: a.country ?? 'US', active: a.active === undefined ? true : !!a.active });
+    routing_number: '', account_number: '', bic: a.bic ?? '', iban: '', currency: a.currency ?? 'USD', country: a.country ?? 'US', active: a.active === undefined ? true : !!a.active });
   const set = (k) => (e) => setF({ ...f, [k]: e.target.type === 'checkbox' ? e.target.checked : e.target.value });
   const us = f.currency === 'USD' && f.country === 'US';
   const owners = f.owner_type === 'PROGRAM' ? (programs.data ?? []).map((p) => [p.id, `${p.client_name} (${p.program_code})`]) : f.owner_type === 'INVESTOR' ? (investors.data ?? []).map((i) => [i.id, `${i.code} · ${i.name}`]) : [];
   const save = () => run(async () => {
     const body = { owner_type: f.owner_type, owner_id: f.owner_type === 'SEAPORT' ? undefined : Number(f.owner_id), account_name: f.account_name, bank_name: f.bank_name, currency: f.currency.toUpperCase(), country: f.country.toUpperCase(), active: f.active,
-      ...(us ? { routing_number: f.routing_number, account_number: f.account_number || undefined } : { bic: f.bic.toUpperCase(), iban: f.iban || undefined }) };
-    if (account) await put(`/api/bank-accounts/${account.id}`, body); else await post('/api/bank-accounts', body);
-    toast('Bank account saved', 'success');
+      ...(us ? { routing_number: f.routing_number || undefined, account_number: f.account_number || undefined } : { bic: f.bic.toUpperCase(), iban: f.iban || undefined }) };
+    const r = account ? await put(`/api/bank-accounts/${account.id}`, body) : await post('/api/bank-accounts', body);
+    toast(doneMessage(r, 'Bank account saved'), isPending(r) ? 'info' : 'success');
     onDone();
   });
   return (
-    <Modal title={account ? `Edit ${account.account_name}` : 'Add beneficiary bank account'} subtitle={account ? 'Re-enter the full account number / IBAN to confirm the change.' : ''} onClose={onClose} width={720}
-      footer={<><Button onClick={onClose}>Cancel</Button><Button variant="primary" disabled={busy || !f.account_name || (us ? !f.account_number : !f.iban)} onClick={save}>Save</Button></>}>
+    <Modal title={account ? `Edit ${account.account_name}` : 'Add beneficiary bank account'} subtitle={account ? `Current ${account.iban_masked ? `IBAN ${account.iban_masked}` : `account ${account.account_number_masked ?? ''}`}. Leave the number blank to keep it. Changes take effect after a second person approves them.` : 'The account becomes usable after a second person approves it.'} onClose={onClose} width={720}
+      footer={<><Button onClick={onClose}>Cancel</Button><Button variant="primary" disabled={busy || !f.account_name || (!account && (us ? !f.account_number : !f.iban))} onClick={save}>Submit for approval</Button></>}>
       <div className="grid g2">
         <Field label="Owner type"><select className="select" value={f.owner_type} disabled={!!account} onChange={set('owner_type')}><option value="PROGRAM">Seller (program)</option><option value="INVESTOR">Investor</option><option value="SEAPORT">Seaport (originator)</option></select></Field>
         {f.owner_type !== 'SEAPORT' ? <Field label="Owner"><select className="select" value={f.owner_id} disabled={!!account} onChange={set('owner_id')}><option value="">Choose…</option>{owners.map(([id, l]) => <option key={id} value={id}>{l}</option>)}</select></Field> : <div />}
@@ -175,7 +175,7 @@ function AccountModal({ account, onClose, onDone }) {
         <Field label="Currency"><input className="input" maxLength={3} value={f.currency} onChange={set('currency')} /></Field>
         <Field label="Bank country"><input className="input" maxLength={2} value={f.country} onChange={set('country')} /></Field>
         {us ? <>
-          <Field label="ABA routing number" hint="9 digits, checksum validated"><input className="input" value={f.routing_number} onChange={set('routing_number')} /></Field>
+          <Field label="ABA routing number" hint={account?.routing_number_masked ? `Now ${account.routing_number_masked}; leave blank to keep` : '9 digits, checksum validated'}><input className="input" value={f.routing_number} onChange={set('routing_number')} autoComplete="off" /></Field>
           <Field label="Account number"><input className="input" value={f.account_number} onChange={set('account_number')} autoComplete="off" /></Field>
         </> : <>
           <Field label="BIC / SWIFT"><input className="input" value={f.bic} onChange={set('bic')} /></Field>

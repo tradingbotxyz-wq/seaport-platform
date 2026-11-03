@@ -15,7 +15,9 @@ Endpoints
   POST /brokerage/market | /route | /economics                                     -> quotes, best-ex routing, trade economics
   POST /pool/stress    {loans[], tranches[], scenarios?}                            -> waterfall, break-even, cash flows
 
-Binds to 127.0.0.1 only; the Node API is its only client. On AWS this maps to a Lambda
+Binds to 127.0.0.1 only; the Node API is its only client. Every POST must carry the shared
+secret in X-Engine-Token (ENGINE_TOKEN, set by the API when it launches the engine), so no other
+local process can drive it. On AWS this maps to a Lambda
 (or ECS task) behind a private endpoint with the same request/response contracts.
 """
 
@@ -24,7 +26,9 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import json
+import traceback
 import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -72,7 +76,7 @@ def handle(path: str, body: dict) -> dict:
     if path == "/pool/stress":
         return pool.stress(body)
     if path == "/pool/concentration":
-        return {"concentration": pool.concentration(body.get("loans") or [], body.get("limits") or {}, int(body.get("target_size_cents") or 0))}
+        return {"concentration": pool.concentration(body.get("loans") or [], body.get("limits") or {}, int(body.get("target_size_cents") or 0), bool(body.get("against_target")))}
     if path == "/payments/file":
         return payments.generate(body)
     if path == "/service/amortize":
@@ -93,8 +97,17 @@ def handle(path: str, body: dict) -> dict:
     raise KeyError(path)
 
 
+TOKEN = os.environ.get("ENGINE_TOKEN", "")
+
+
+def _authorised(headers) -> bool:
+    return bool(TOKEN) and hmac.compare_digest(headers.get("X-Engine-Token") or "", TOKEN)
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SeaportEngine/" + VERSION
+    server_version = "SeaportEngine"
+    sys_version = ""
+    timeout = 60  # seconds a client may take to send its request
 
     def _send(self, status: int, payload: dict) -> None:
         data = json.dumps(payload).encode()
@@ -106,12 +119,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if self.path == "/health":
-            self._send(200, {"status": "ok", "service": "engine", "version": VERSION})
+            self._send(200, {"status": "ok", "service": "engine", "authenticated": _authorised(self.headers)})
         else:
             self._send(404, {"error": "not_found"})
 
     def do_POST(self):  # noqa: N802
-        length = int(self.headers.get("Content-Length") or 0)
+        if not _authorised(self.headers):
+            self._send(401, {"error": "unauthorized"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._send(400, {"error": "bad_length"})
+            return
         if length > MAX_BODY:
             self._send(413, {"error": "payload_too_large"})
             return
@@ -128,8 +148,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not_found"})
         except EngineError as exc:
             self._send(422, {"error": "validation_error", "message": str(exc)})
-        except Exception as exc:  # pragma: no cover - defensive
-            self._send(500, {"error": "engine_error", "message": f"{type(exc).__name__}: {exc}"})
+        except Exception:  # pragma: no cover - defensive; details stay in the server log
+            traceback.print_exc(file=sys.stderr)
+            self._send(500, {"error": "engine_error", "message": "Internal engine error"})
 
     def log_message(self, fmt, *args):
         if os.environ.get("ENGINE_DEBUG"):
@@ -137,6 +158,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    if len(TOKEN) < 32:
+        print("[engine] ENGINE_TOKEN (32+ characters) is required; the API sets it when it launches the engine.", file=sys.stderr, flush=True)
+        sys.exit(2)
     port = int(os.environ.get("ENGINE_PORT", "8001"))
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"[engine] Python analytics engine listening on http://127.0.0.1:{port}", flush=True)

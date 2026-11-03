@@ -8,6 +8,7 @@
 //   Trade settled    Dr 1000 Cash / Cr 1310
 
 import type { Services, User } from '../core/context.ts';
+import { assertNotRecentlyReset } from '../core/cooldown.ts';
 import { requirePermission, now, nextRef, addBusinessDays } from '../core/context.ts';
 import * as audit from '../core/audit.ts';
 import { emit } from '../core/outbox.ts';
@@ -21,6 +22,7 @@ const MAX_ORDER_USD_CENTS = 50_000_000_00; // single-order limit per client (pre
 const FAT_FINGER_BPS = 300;                 // limit price more than 3% away from market is rejected
 
 const px = (p: number) => (p / 10000).toFixed(4);
+const COMMISSION_MINIMUM_CENTS = 25_000; // per order (engine schedule minimum)
 
 // ---------- Brokers & introducers ----------
 
@@ -58,6 +60,7 @@ export async function onboardBroker(svc: Services, user: User, body: unknown) {
 
 export function decideBroker(svc: Services, user: User, id: number, body: any) {
   requirePermission(user, 'brokerage.approve');
+  assertNotRecentlyReset(svc, user);
   const b = svc.db.get('SELECT * FROM brokers WHERE id = ?', [id]);
   if (!b) throw notFound('Broker');
   const status = body?.status;
@@ -162,9 +165,25 @@ export async function placeOrder(svc: Services, user: User, body: unknown) {
   const routed = await svc.engine.call('/brokerage/route', { instrument: inst, side: input.side, quantity: input.quantity, limit_price: input.order_type === 'LIMIT' ? input.limit_price : null, ts });
   const tradeDate = svc.today();
   const settle = addBusinessDays(tradeDate, inst.settlement_days);
-  const econ = [];
-  for (const f of routed.fills) {
-    econ.push(await svc.engine.call('/brokerage/economics', { instrument: inst, side: input.side, quantity: f.quantity, price: f.price, settlement_date: settle, fee_bps: f.fee_bps, rebate_bps_of_commission: intro?.rebate_bps_of_commission ?? 0 }));
+  // The commission tier and the minimum charge apply to the ORDER, not to each venue fill:
+  // splitting an order across venues must never cost the client more.
+  const econ: any[] = [];
+  const filledQty = routed.fills.reduce((a: number, f: any) => a + f.quantity, 0);
+  const rebateBps = intro?.rebate_bps_of_commission ?? 0;
+  if (routed.fills.length) {
+    const orderTier = await svc.engine.call('/brokerage/economics', { instrument: inst, side: input.side, quantity: filledQty, price: routed.fills[0].price, settlement_date: settle, fee_bps: 0, rebate_bps_of_commission: 0 });
+    for (const f of routed.fills) {
+      econ.push(await svc.engine.call('/brokerage/economics', { instrument: inst, side: input.side, quantity: f.quantity, price: f.price, settlement_date: settle, fee_bps: f.fee_bps,
+        rebate_bps_of_commission: rebateBps, schedule: { tiers: [[null, orderTier.commission_bps]], min_cents: 0 } }));
+    }
+    const total = econ.reduce((a, e) => a + e.commission_cents, 0);
+    const shortfall = COMMISSION_MINIMUM_CENTS - total;
+    if (shortfall > 0) { // order minimum: added to the largest fill
+      const big = econ.reduce((m, e) => (e.principal_cents > m.principal_cents ? e : m), econ[0]);
+      big.commission_cents += shortfall;
+      big.net_cents += input.side === 'BUY' ? shortfall : -shortfall;
+    }
+    for (const e of econ) e.rebate_cents = Math.round((e.commission_cents * rebateBps) / 10000);
   }
   const result = svc.db.tx(() => {
     const ref = nextRef(svc.db, 'ORD', 6);
@@ -216,6 +235,7 @@ export function listTrades(svc: Services) {
 
 export function settleTrade(svc: Services, user: User, id: number) {
   requirePermission(user, 'brokerage.settle');
+  assertNotRecentlyReset(svc, user);
   const t = svc.db.get('SELECT t.*, o.created_by AS trader, o.investor_id FROM trades t JOIN orders o ON o.id = t.order_id WHERE t.id = ?', [id]);
   if (!t) throw notFound('Trade');
   if (t.status !== 'CONFIRMED') throw conflict(`Trade is ${t.status}`);

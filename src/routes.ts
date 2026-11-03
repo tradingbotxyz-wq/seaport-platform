@@ -1,6 +1,6 @@
 import { Router } from './lib/http.ts';
 import { intParam } from './lib/validate.ts';
-import { notFound } from './lib/errors.ts';
+import { notFound, forbidden } from './lib/errors.ts';
 import * as audit from './core/audit.ts';
 import { can, PERMISSIONS } from './core/context.ts';
 import * as master from './modules/master.ts';
@@ -19,16 +19,33 @@ import * as reporting from './modules/reporting.ts';
 import * as portal from './modules/portal.ts';
 import * as brokerage from './modules/brokerage.ts';
 import * as dash from './modules/dashboard.ts';
+import * as auth from './modules/auth.ts';
+import * as approvals from './modules/approvals.ts';
+import { notFound as nf } from './lib/errors.ts';
 import { requirePermission } from './core/context.ts';
 
 export function buildRouter(): Router {
   const r = new Router();
 
-  // Public: health + sign-in user picker (local/dev authentication; Cognito/SSO in AWS)
+  // Public: health (load balancers) and authentication
   r.get('/api/health', async ({ services }) => ({
-    status: 'ok', api: 'node', engine: (await services.engine.health()) ? 'ok' : 'down', today: services.today(),
+    status: 'ok', engine: (await services.engine.health()) ? 'ok' : 'down',
   }), { public: true });
-  r.get('/api/users', ({ services }) => access.listUsersPublic(services), { public: true });
+  r.get('/api/auth/config', ({ services }) => auth.config(services), { public: true });
+  r.get('/api/auth/session', ({ services, user, session }) => auth.session(services, user, session), { public: true });
+  r.post('/api/auth/login', ({ services, req, body }) => auth.login(services, req, body), { public: true });
+  r.post('/api/auth/logout', ({ services, user, session }) => auth.logout(services, user, session), { public: true });
+  r.post('/api/auth/mfa', ({ services, req, user, session, body }) => auth.verifyMfa(services, req, user, session!, body));
+  r.post('/api/auth/mfa/setup', ({ services, user, session }) => auth.setupMfa(services, user, session));
+  r.post('/api/auth/mfa/confirm', ({ services, req, user, session, body }) => auth.confirmMfa(services, req, user, session, body));
+  r.post('/api/auth/password', ({ services, req, user, session, body }) => auth.changePassword(services, req, user, session, body));
+  r.get('/api/auth/sessions', ({ services, user, session }) => auth.listSessions(services, user, session));
+  r.post('/api/auth/sessions/:id/revoke', ({ services, user, params }) => auth.revokeSession(services, user, params.id));
+  // Demo mode only: the sign-in user picker. Never available with password sign-in.
+  r.get('/api/users', ({ services }) => {
+    if (services.auth.mode !== 'demo') throw nf('Route');
+    return access.listUsersPublic(services);
+  }, { public: true });
 
   // Session
   r.get('/api/me', ({ services, user }) => access.profile(services, user));
@@ -91,7 +108,10 @@ export function buildRouter(): Router {
   r.get('/api/distributions', ({ services }) => fund.listDistributions(services));
   r.post('/api/distributions', ({ services, user, body }) => fund.createDistribution(services, user, body));
   r.post('/api/distributions/:id/approve', ({ services, user, params }) => fund.approveDistribution(services, user, intParam(params.id)));
-  r.get('/api/bank-accounts', ({ services }) => fund.listBankAccounts(services));
+  r.get('/api/bank-accounts', ({ services, user }) => {
+    if (!['payments.view', 'payments.accounts', 'payments.accounts.approve', 'payments.prepare', 'payments.approve'].some((p) => can(user, p))) throw forbidden('Your role cannot see bank accounts');
+    return fund.listBankAccounts(services);
+  });
   r.post('/api/bank-accounts', ({ services, user, body }) => fund.saveBankAccount(services, user, null, body));
   r.put('/api/bank-accounts/:id', ({ services, user, params, body }) => fund.saveBankAccount(services, user, intParam(params.id), body));
   r.get('/api/payments/queue', ({ services }) => fund.paymentQueue(services));
@@ -107,9 +127,9 @@ export function buildRouter(): Router {
   // Servicing
   r.get('/api/servicing/summary', ({ services }) => service.serviceSummary(services));
   r.get('/api/servicing/delinquency', ({ services }) => service.delinquency(services));
-  r.post('/api/servicing/sweep', ({ services }) => service.sweep(services));
+  r.post('/api/servicing/sweep', ({ services, user }) => { requirePermission(user, 'service.run'); return service.sweep(services); });
   r.post('/api/servicing/late-fees', ({ services, user }) => service.postLateFees(services, user));
-  r.post('/api/servicing/workout', ({ services, body }) => service.workout(services, body));
+  r.post('/api/servicing/workout', ({ services, user, body }) => { requirePermission(user, 'service.run'); return service.workout(services, body); });
   r.get('/api/servicing/loans/:id', ({ services, params }) => service.loanSubledger(services, intParam(params.id)));
   r.get('/api/cases', ({ services, user, query }) => service.listCases(services, user, query));
   r.post('/api/cases', ({ services, user, body }) => service.createCase(services, user, body));
@@ -200,9 +220,18 @@ export function buildRouter(): Router {
   r.get('/api/access', ({ services }) => access.accessOverview(services));
   r.post('/api/access/users', ({ services, user, body }) => access.createUser(services, user, body));
   r.put('/api/access/users/:username', ({ services, user, params, body }) => access.updateUser(services, user, params.username, body));
+  r.post('/api/access/users/:username/reset-password', ({ services, user, params }) => auth.adminResetPassword(services, user, params.username));
+  r.post('/api/access/users/:username/reset-mfa', ({ services, user, params }) => auth.adminResetMfa(services, user, params.username));
+  r.post('/api/access/users/:username/unlock', ({ services, user, params }) => auth.adminUnlock(services, user, params.username));
+
+  // Approvals (maker-checker for reference data, bank details and access)
+  r.get('/api/approvals', ({ services, user, query }) => approvals.listChanges(services, user, query));
+  r.post('/api/approvals/:id/decide', ({ services, user, params, body }) => approvals.decideChange(services, user, intParam(params.id), body));
+  r.post('/api/approvals/:id/cancel', ({ services, user, params }) => approvals.cancelChange(services, user, intParam(params.id)));
 
   // Audit
-  r.get('/api/audit', ({ services, query }) => {
+  r.get('/api/audit', ({ services, user, query }) => {
+    if (!can(user, 'reports.regulatory') && !can(user, 'users.manage')) throw forbidden('Only Compliance, Audit and administrators can read the audit trail');
     const type = query.get('entity_type');
     const id = query.get('entity_id');
     const rows = type

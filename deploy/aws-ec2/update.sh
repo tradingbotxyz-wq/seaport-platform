@@ -11,6 +11,8 @@ sudo -u "$OWNER" git -C "$SRC_DIR" pull --ff-only
 rsync -a --delete --exclude .git --exclude data --exclude node_modules "$SRC_DIR/" "$APP_DIR/"
 chown -R seaport:seaport "$APP_DIR"
 cp "$APP_DIR/deploy/aws-ec2/seaport.service" /etc/systemd/system/seaport.service
+cp "$APP_DIR/deploy/aws-ec2/nginx-proxy.conf" /etc/nginx/seaport-proxy.conf
+nginx -t && systemctl reload nginx
 systemctl daemon-reload
 systemctl restart seaport     # database migrations run automatically on start
 for i in $(seq 1 30); do curl -fs http://127.0.0.1:3000/api/health >/dev/null && break; sleep 2; done

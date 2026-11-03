@@ -6,6 +6,7 @@
 // generates a credit memo and term sheet (PDF). Every step is audit-logged.
 
 import type { Services, User } from '../core/context.ts';
+import { assertNotRecentlyReset } from '../core/cooldown.ts';
 import { requirePermission, can, now, nextRef, addDays } from '../core/context.ts';
 import * as audit from '../core/audit.ts';
 import { emit } from '../core/outbox.ts';
@@ -161,12 +162,13 @@ export function getApplication(svc: Services, user: User, id: number) {
 
 function decisionRights(svc: Services, user: User, a: any, usdCents: number) {
   const rules = (() => { try { return currentScorecard(svc).model.rules; } catch { return {}; } })();
-  const aboveAuthority = usdCents > (rules.authority_limit_usd_cents ?? Infinity);
+  const aboveAuthority = !Number.isFinite(usdCents) || usdCents > (rules.authority_limit_usd_cents ?? 0);
   const knockout = a.engine?.outcome === 'DECLINE';
   const reasons: string[] = [];
   if (!['IN_REVIEW', 'REFERRED'].includes(a.status)) reasons.push(`Application is ${a.status}`);
-  if (!can(user, 'underwrite.decide')) reasons.push('Your role cannot decide credit applications');
-  if (a.prepared_by === user.username) reasons.push('Maker-checker: you prepared this application (SoD-6)');
+  if (!can(user, 'underwrite.decide') && !can(user, 'underwrite.committee')) reasons.push('Your role cannot decide credit applications');
+  const editors: string[] = (() => { try { return JSON.parse(a.editors || '[]'); } catch { return []; } })();
+  if (a.prepared_by === user.username || editors.includes(user.username)) reasons.push('Maker-checker: you prepared, edited or submitted this application (SoD-6)');
   return {
     can_edit: a.status === 'DRAFT' && can(user, 'underwrite.prepare'),
     can_submit: a.status === 'DRAFT' && can(user, 'underwrite.prepare'),
@@ -220,6 +222,14 @@ export function createApplication(svc: Services, user: User, body: any) {
   });
 }
 
+/** Everyone who edited or submitted an application is barred from deciding it (SoD-6). */
+function addEditor(svc: Services, id: number, username: string) {
+  const row = svc.db.get<any>('SELECT editors, prepared_by FROM credit_applications WHERE id = ?', [id]);
+  const list: string[] = JSON.parse(row?.editors || '[]');
+  for (const u of [row?.prepared_by, username]) if (u && !list.includes(u)) list.push(u);
+  svc.db.run('UPDATE credit_applications SET editors = ? WHERE id = ?', [JSON.stringify(list), id]);
+}
+
 export function updateApplication(svc: Services, user: User, id: number, body: any) {
   requirePermission(user, 'underwrite.prepare');
   const a = load(svc, id);
@@ -236,6 +246,7 @@ export function updateApplication(svc: Services, user: User, id: number, body: a
         input.max_tenor_days ?? 120, input.collateral_type ?? null, input.collateral_value_cents ?? null, JSON.stringify(extras.financials), input.rationale ?? null, now(), id],
     );
     if (r.changes !== 1) throw conflict('Application changed - reload and try again');
+    addEditor(svc, id, user.username);
     audit.record(svc.db, user, 'credit_application.updated', 'credit_application', id, { requested_limit_cents: input.requested_limit_cents, years: extras.financials.map((f: any) => f.year) });
     return { ok: true };
   });
@@ -277,6 +288,7 @@ export async function submitApplication(svc: Services, user: User, id: number, r
       [status, JSON.stringify(r.screening), JSON.stringify(r.bureau), JSON.stringify(r.engine), r.scorecard_version, now(), now(), id, a.row_version],
     );
     if (upd.changes !== 1) throw conflict('Application changed while scoring - reload and try again');
+    if (!rescore) addEditor(svc, id, user.username);
     audit.record(svc.db, user, rescore ? 'credit_application.rescored' : 'credit_application.submitted', 'credit_application', id, {
       score: r.engine.score, rating: r.engine.rating, outcome: r.engine.outcome, knockouts: r.engine.knockouts, refers: r.engine.refers,
       scorecard_version: r.scorecard_version, screening_ref: r.screening.reference, bureau_ref: r.bureau.reference,
@@ -313,7 +325,8 @@ export function withdrawApplication(svc: Services, user: User, id: number, body:
 }
 
 export async function decide(svc: Services, user: User, id: number, body: any) {
-  requirePermission(user, 'underwrite.decide');
+  requirePermission(user, can(user, 'underwrite.decide') ? 'underwrite.decide' : 'underwrite.committee');
+  assertNotRecentlyReset(svc, user);
   const input = check<any>(body, {
     decision: { type: 'enum', required: true, values: ['APPROVE', 'DECLINE'] },
     reason: { type: 'string', required: true, maxLength: 4000 },
@@ -327,14 +340,19 @@ export async function decide(svc: Services, user: User, id: number, body: any) {
   });
   const a = parse(load(svc, id));
   if (!['IN_REVIEW', 'REFERRED'].includes(a.status)) throw conflict(`Application is ${a.status}`);
-  if (a.prepared_by === user.username) throw forbidden('Maker-checker: the decision must be made by someone other than the preparer (SoD-6)');
+  const editors: string[] = JSON.parse(svc.db.get<any>('SELECT editors FROM credit_applications WHERE id = ?', [id])?.editors || '[]');
+  if (a.prepared_by === user.username || editors.includes(user.username)) {
+    throw forbidden('Maker-checker: the decision must be made by someone who did not prepare, edit or submit this application (SoD-6)');
+  }
   const engine = a.engine;
   if (!engine) throw conflict('Application has not been scored');
   const program = svc.db.get('SELECT * FROM programs WHERE id = ?', [a.program_id]);
   const limit = input.decision === 'APPROVE' ? input.approved_limit_cents ?? a.requested_limit_cents : null;
   if (limit && limit > a.requested_limit_cents) throw validation({ approved_limit_cents: 'cannot exceed the requested limit' });
-  const usdLimit = limit ? fxToUsd(svc.db)(limit, program.currency) : 0;
-  const authority = currentScorecard(svc).model.rules.authority_limit_usd_cents ?? Infinity;
+  const rawUsd = limit ? fxToUsd(svc.db)(limit, program.currency) : 0;
+  // No FX rate for the currency: fail closed and treat the limit as above authority.
+  const usdLimit = Number.isFinite(rawUsd) ? rawUsd : Number.MAX_SAFE_INTEGER;
+  const authority = currentScorecard(svc).model.rules.authority_limit_usd_cents ?? 0;
   const override = (input.decision === 'APPROVE' && engine.outcome !== 'APPROVE') || (input.decision === 'DECLINE' && engine.outcome === 'APPROVE');
   if (input.decision === 'APPROVE' && (engine.outcome === 'DECLINE' || usdLimit > authority) && !can(user, 'underwrite.committee')) {
     throw forbidden(engine.outcome === 'DECLINE'

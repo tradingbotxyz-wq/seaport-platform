@@ -6,6 +6,7 @@ import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import type { Services, User } from '../core/context.ts';
+import { can } from '../core/context.ts';
 import { now } from '../core/context.ts';
 import * as audit from '../core/audit.ts';
 import { notFound } from '../lib/errors.ts';
@@ -52,12 +53,29 @@ export function listDocuments(svc: Services, entity_type: string, entity_id: num
     [entity_type, entity_id]);
 }
 
+/** Which staff permissions may open each kind of stored document. */
+const DOC_ACCESS: Record<string, string[]> = {
+  payment_batch: ['payments.view', 'payments.approve', 'payments.prepare'],
+  credit_application: ['underwrite.prepare', 'underwrite.decide', 'underwrite.committee', 'reports.regulatory'],
+  capital_call: ['fund.call', 'fund.approve', 'portal.statements', 'reports.regulatory'],
+  investor: ['fund.call', 'fund.approve', 'portal.statements', 'brokerage.trade', 'brokerage.settle', 'reports.regulatory'],
+};
+
+export function canStaffSee(user: User, d: { entity_type: string; created_by: string }) {
+  if (d.entity_type === 'report') return d.created_by === user.username || can(user, 'reports.regulatory'); // exports belong to whoever ran them
+  const perms = DOC_ACCESS[d.entity_type] ?? ['reports.view'];
+  return perms.some((p) => can(user, p));
+}
+
 export async function downloadDocument(svc: Services, id: number, user?: User) {
   const d = svc.db.get('SELECT * FROM documents WHERE id = ?', [id]);
   if (!d) throw notFound('Document');
-  if (user?.role === 'INVESTOR') {
+  if (!user) throw notFound('Document');
+  if (user.role === 'INVESTOR') {
     const { canInvestorSee } = await import('./portal.ts');
     if (!canInvestorSee(svc, user, d)) throw notFound('Document');
+  } else if (!canStaffSee(user, d)) {
+    throw notFound('Document'); // same answer as "does not exist": no probing of ids
   }
   const bytes = await readFile(join(svc.filesDir, d.storage_key));
   return { text: bytes as any, contentType: d.content_type, filename: d.filename };

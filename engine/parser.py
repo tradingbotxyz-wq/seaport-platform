@@ -12,6 +12,8 @@ import io
 import re
 import zipfile
 import zlib
+
+MAX_INFLATED = 60 * 1024 * 1024  # bytes of decompressed content per file
 from datetime import date, datetime, timedelta
 from xml.etree import ElementTree as ET
 
@@ -79,26 +81,60 @@ def map_headers(headers: list[str], kind: str) -> dict[str, int]:
 
 
 def parse_amount(value) -> int | None:
-    """Return integer cents. Accepts 1,250,000.00 / USD 1 250 000 / (1,000) / 1.250.000,50."""
-    if value is None:
+    """Return integer cents, or None when the text is not an unambiguous amount.
+
+    Accepts 1,250,000.00 / USD 1 250 000 / 1.250.000,50 / and the debit notations
+    -1,000.00, (1,000.00), 1,000.00-, 1,000.00 DR, −1,000.00 (Unicode minus). "CR" marks a credit.
+    Ambiguous text such as 1.250 (thousands or decimals?) is refused rather than guessed.
+    """
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
+        if value != value or abs(value) > 1e13:  # NaN or absurd
+            return None
         return int(round(float(value) * 100))
-    s = str(value).strip()
-    if not s:
+    s = str(value).strip().replace("\u2212", "-").replace("\u2013", "-").replace("\u00a0", " ")
+    if not s or len(s) > 40:
         return None
-    neg = s.startswith("(") and s.endswith(")") or s.startswith("-")
-    s = re.sub(r"[^0-9.,]", "", s)
-    if not s:
+    up = s.upper()
+    neg = False
+    if up.endswith("DR") or up.endswith(" D"):
+        neg, s = True, s[:-2].strip()
+    elif up.endswith("CR"):
+        s = s[:-2].strip()
+    if s.startswith("(") and s.endswith(")"):
+        neg, s = True, s[1:-1].strip()
+    elif s.startswith("(") or s.endswith(")"):
+        return None
+    s = re.sub(r"^[A-Za-z$\u00a3\u20ac\u00a5 ]+", "", s)  # leading currency code or symbol
+    if s.startswith("-"):
+        neg, s = (not neg) if neg else True, s[1:].strip()
+    if s.endswith("-"):
+        neg, s = True, s[:-1].strip()
+    s = s.replace(" ", "").replace("'", "")
+    if not re.fullmatch(r"[0-9.,]+", s):
         return None
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):  # European 1.250.000,50
+            if not re.fullmatch(r"\d{1,3}(\.\d{3})*,\d{1,2}", s):
+                return None
             s = s.replace(".", "").replace(",", ".")
         else:
+            if not re.fullmatch(r"\d{1,3}(,\d{3})*\.\d{1,2}", s):
+                return None
             s = s.replace(",", "")
     elif "," in s:
-        parts = s.split(",")
-        s = s.replace(",", "") if len(parts[-1]) == 3 or len(parts) > 2 else s.replace(",", ".")
+        if re.fullmatch(r"\d{1,3}(,\d{3})+", s):
+            s = s.replace(",", "")
+        elif re.fullmatch(r"\d+,\d{1,2}", s):
+            s = s.replace(",", ".")
+        else:
+            return None
+    elif "." in s:
+        if re.fullmatch(r"\d{1,3}(\.\d{3})+", s):
+            return None  # 1.250 / 1.250.000: thousands separator or decimals - refuse to guess
+        if not re.fullmatch(r"\d+(\.\d{1,2})?", s):
+            return None
     try:
         cents = int(round(float(s) * 100))
     except ValueError:
@@ -187,15 +223,32 @@ def read_xlsx(data: bytes) -> list[list]:
         z = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as exc:
         raise EngineError("File is not a valid .xlsx workbook") from exc
+    infos = z.infolist()
+    if len(infos) > 500:
+        raise EngineError("Workbook has too many parts")
+    total = sum(i.file_size for i in infos)
+    if total > MAX_INFLATED:
+        raise EngineError("Workbook expands to more than 60 MB; split it into smaller files")
+    for i in infos:
+        if i.compress_size and i.file_size / i.compress_size > 200:
+            raise EngineError("Workbook compression ratio is suspicious (possible zip bomb)")
+
+    def read_part(name: str) -> bytes:
+        with z.open(name) as fh:
+            out = fh.read(MAX_INFLATED + 1)  # never trust the declared size
+        if len(out) > MAX_INFLATED:
+            raise EngineError("Workbook part too large")
+        return out
+
     shared: list[str] = []
     if "xl/sharedStrings.xml" in z.namelist():
-        root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+        root = ET.fromstring(read_part("xl/sharedStrings.xml"))
         for si in root.findall("m:si", ns):
             shared.append("".join(t.text or "" for t in si.iter(f"{{{ns['m']}}}t")))
     sheets = sorted(n for n in z.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n))
     if not sheets:
         raise EngineError("Workbook has no worksheets")
-    root = ET.fromstring(z.read(sheets[0]))
+    root = ET.fromstring(read_part(sheets[0]))
     rows = []
     for r in root.iter(f"{{{ns['m']}}}row"):
         cells: dict[int, object] = {}
@@ -203,7 +256,10 @@ def read_xlsx(data: bytes) -> list[list]:
             t = c.get("t")
             v = c.find("m:v", ns)
             if t == "s" and v is not None:
-                val = shared[int(v.text)]
+                try:
+                    val = shared[int(v.text)]
+                except (ValueError, IndexError, TypeError):
+                    raise EngineError("Workbook references a missing shared string") from None
             elif t == "inlineStr":
                 val = "".join(x.text or "" for x in c.iter(f"{{{ns['m']}}}t"))
             elif v is not None:
@@ -230,12 +286,34 @@ def _pdf_text(data: bytes) -> str:
     two spaces (read_pdf then splits on that).
     """
     chunks = []
-    for m in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", data, re.S):
-        raw = m.group(1)
+    inflated = 0
+    pos = 0
+    while len(chunks) < 2000:  # linear scan for stream ... endstream (no backtracking regex)
+        start = data.find(b"stream", pos)
+        if start < 0:
+            break
+        body = start + 6
+        if data[body:body + 2] == b"\r\n":
+            body += 2
+        elif data[body:body + 1] in (b"\n", b"\r"):
+            body += 1
+        else:
+            pos = body
+            continue
+        end = data.find(b"endstream", body)
+        if end < 0:
+            break
+        raw = data[body:end].rstrip(b"\r\n")
+        pos = end + 9
         try:
-            chunks.append(zlib.decompress(raw))
+            d = zlib.decompressobj()
+            out = d.decompress(raw, MAX_INFLATED - inflated + 1)
+            if len(out) > MAX_INFLATED - inflated:
+                raise EngineError("PDF expands to more than 60 MB of content; it cannot be read")
         except zlib.error:
-            chunks.append(raw)
+            out = raw
+        inflated += len(out)
+        chunks.append(out)
 
     def unescape(s: bytes) -> str:
         s = re.sub(rb"\\([nrtbf()\\])", lambda x: {b"n": b" ", b"r": b"", b"t": b" ", b"b": b"", b"f": b"", b"(": b"(", b")": b")", b"\\": b"\\"}[x.group(1)], s)

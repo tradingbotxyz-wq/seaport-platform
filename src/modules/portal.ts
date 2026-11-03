@@ -111,12 +111,12 @@ export function submitRequest(svc: Services, user: User, body: unknown) {
   if (input.commitment_id && !svc.db.get('SELECT id FROM commitments WHERE id = ? AND investor_id = ?', [input.commitment_id, inv.id])) throw forbidden('Not your commitment');
   const type = input.kind === 'REDEMPTION' ? 'REDEMPTION' : input.kind === 'TRANSFER' ? 'TRANSFER' : 'INVESTOR_REQUEST';
   const labels: Record<string, string> = { QUESTION: 'Question', DOCUMENT: 'Document request', REDEMPTION: 'Redemption request', TRANSFER: 'Transfer request', DETAILS_CHANGE: 'Change of details' };
-  // Investors may create cases only through this endpoint; createCase checks service.cases, so act as the portal.
-  const portalUser: User = { ...user, role: 'OPS_MAKER' };
-  return createCase(svc, portalUser, {
+  // Investors may create cases only through this endpoint. The case is opened by the portal on the
+  // investor's behalf: the audit trail records the investor's own username and role.
+  return createCase(svc, user, {
     case_type: type, priority: input.kind === 'REDEMPTION' ? 'HIGH' : 'MEDIUM', subject: `${labels[input.kind]} from ${inv.name} (${inv.code})`, description: input.message,
     entity_type: input.commitment_id ? 'commitment' : 'investor', entity_id: input.commitment_id ?? inv.id,
-  });
+  }, true);
 }
 
 /** Can this investor user download this document? */

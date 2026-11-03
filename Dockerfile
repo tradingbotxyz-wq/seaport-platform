@@ -1,7 +1,9 @@
 # Seaport Global platform: Node API + React UI + Python engine in one container.
 #   docker build -t seaport-platform .
-#   docker run -d -p 3000:3000 -v seaport-data:/data --name seaport seaport-platform
+#   docker run -d -p 127.0.0.1:3000:3000 -v seaport-data:/data --env-file /etc/seaport/seaport.env --name seaport seaport-platform
 # Data (SQLite database + documents) lives in /data - always mount a volume there.
+# Publish the port on 127.0.0.1 only and put nginx (HTTPS) in front: Docker's own port
+# publishing bypasses host firewalls such as ufw.
 
 FROM node:22-bookworm-slim
 
@@ -18,6 +20,9 @@ COPY engine ./engine
 COPY public ./public
 
 ENV NODE_ENV=production \
+    TRUST_PROXY=true \
+    COOKIE_SECURE=true \
+    PYTHONDONTWRITEBYTECODE=1 \
     HOST=0.0.0.0 \
     PORT=3000 \
     ENGINE_PORT=8001 \
@@ -25,7 +30,7 @@ ENV NODE_ENV=production \
     DB_PATH=/data/seaport.db \
     FILES_DIR=/data/files
 
-RUN mkdir -p /data && chown -R node:node /data /app
+RUN mkdir -p /data && chown -R node:node /data   # code stays root-owned and read-only to the app
 USER node
 VOLUME ["/data"]
 EXPOSE 3000

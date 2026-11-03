@@ -11,6 +11,8 @@ User=seaport
 Group=seaport
 WorkingDirectory=/opt/seaport-platform
 Environment=NODE_ENV=production
+# Secrets (APP_SECRET, optional ENGINE_TOKEN) live in a root-only file, never in this unit:
+EnvironmentFile=/etc/seaport/seaport.env
 Environment=HOST=127.0.0.1
 Environment=PORT=3000
 Environment=ENGINE_PORT=8001
@@ -23,11 +25,29 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/bin/node --disable-warning=ExperimentalWarning src/server.ts
 Restart=on-failure
 RestartSec=5
+# Behind nginx on the same host: trust its X-Forwarded-* headers; cookies are Secure (HTTPS only).
+Environment=TRUST_PROXY=true
+Environment=COOKIE_SECURE=true
+# Resource limits: a runaway request cannot take the whole server down.
+MemoryMax=1500M
+CPUQuota=180%
+TasksMax=256
+LimitNOFILE=4096
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
 ReadWritePaths=/var/lib/seaport
 
 [Install]

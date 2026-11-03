@@ -1,15 +1,16 @@
 import { useState } from 'react';
-import { useApi, post, put, dateTime, initials } from '../lib.js';
+import { useApi, post, put, dateTime, initials, doneMessage, isPending } from '../lib.js';
 import { useSession } from '../session.js';
-import { Card, Kpi, Field, Button, Pill, ErrorBox, Loading, Icon, useUi, useAction } from '../ui.jsx';
+import { Card, Kpi, Field, Button, Pill, ErrorBox, Loading, Icon, Modal, useUi, useAction } from '../ui.jsx';
 
 
 export default function Access() {
   const { me, can } = useSession();
-  const { toast } = useUi();
+  const { toast, ask } = useUi();
   const { data: d, error, reload } = useApi('/api/access');
   const [busy, run] = useAction();
   const [form, setForm] = useState({ username: '', name: '', email: '', role: 'VIEWER' });
+  const [temp, setTemp] = useState(null);
   if (error) return <ErrorBox error={error} />;
   if (!d) return <Loading />;
   const manage = can('users.manage');
@@ -17,16 +18,26 @@ export default function Access() {
   const ROLE_ORDER = d.roles.map((r) => r.role);
 
   const update = (u, patch) => run(async () => {
-    await put(`/api/access/users/${u.username}`, patch);
-    toast(`${u.name} updated`, 'success');
+    const r = await put(`/api/access/users/${u.username}`, patch);
+    toast(doneMessage(r, `${u.name} updated`), isPending(r) ? 'info' : 'success');
     reload();
   });
   const create = () => run(async () => {
-    await post('/api/access/users', { ...form, email: form.email || undefined });
-    toast(`${form.name} added`, 'success');
+    const r = await post('/api/access/users', { ...form, email: form.email || undefined });
+    toast(doneMessage(r, `${form.name} added`), isPending(r) ? 'info' : 'success');
     setForm({ username: '', name: '', email: '', role: 'VIEWER' });
     reload();
   });
+
+  const resetPassword = async (u) => {
+    if (!(await ask({ title: `Request a password reset for ${u.name}?`, message: 'A second administrator or Compliance approves the reset and receives the one-time password to give to the user. They are then signed out everywhere and must choose a new password.', confirm: 'Request reset' }))) return;
+    run(async () => { const r = await post(`/api/access/users/${u.username}/reset-password`); toast(doneMessage(r, 'Reset requested'), 'info'); reload(); });
+  };
+  const resetMfa = async (u) => {
+    if (!(await ask({ title: `Request an MFA reset for ${u.name}?`, message: 'Use this when someone lost their phone. A second administrator or Compliance verifies their identity and approves it; they then set up a new authenticator at their next sign-in.', confirm: 'Request reset' }))) return;
+    run(async () => { const r = await post(`/api/access/users/${u.username}/reset-mfa`); toast(doneMessage(r, 'Reset requested'), 'info'); reload(); });
+  };
+  const unlock = (u) => run(async () => { await post(`/api/access/users/${u.username}/unlock`); toast(`${u.name} unlocked`, 'success'); reload(); });
 
   return (
     <>
@@ -34,18 +45,17 @@ export default function Access() {
         {d.roles.filter((r) => r.users > 0 || r.role === 'ADMIN').map((r) => <Kpi key={r.role} label={r.label} value={r.users} sub={`${r.users === 1 ? 'user' : 'users'} · ${r.role}`} />)}
       </div>
 
-      <Card title="Users" subtitle={manage ? 'Change a role or deactivate a user. You cannot change your own access (SoD-4).' : 'Only an administrator can change access.'}>
+      <Card title="Users" subtitle={manage ? 'Role changes and new users take effect when a second administrator or Compliance approves them (SoD-4). Deactivation is immediate. You cannot change your own access.' : 'Only an administrator can change access.'}>
         <div className="table-wrap">
           <table className="tbl">
-            <thead><tr><th>User</th><th>Username</th><th>Email</th><th>Role</th><th>Active</th><th>Created</th></tr></thead>
+            <thead><tr><th>User</th><th>Username</th><th>Role</th><th>Active</th><th>Sign-in</th><th>Last sign-in</th>{manage && <th />}</tr></thead>
             <tbody>
               {d.users.map((u) => {
                 const self = u.username === me.username;
                 return (
                   <tr key={u.username} className={u.active ? '' : 'dim'}>
-                    <td><div className="row" style={{ flexWrap: 'nowrap' }}><span className="avatar" style={{ width: 28, height: 28, fontSize: 11 }}>{initials(u.name)}</span><b>{u.name}</b>{self && <Pill tone="info">you</Pill>}</div></td>
+                    <td><div className="row" style={{ flexWrap: 'nowrap' }}><span className="avatar" style={{ width: 28, height: 28, fontSize: 11 }}>{initials(u.name)}</span><div><b>{u.name}</b>{self && <Pill tone="info">you</Pill>}<div className="small muted">{u.email ?? ''}</div></div></div></td>
                     <td className="mono">{u.username}</td>
-                    <td>{u.email ?? '—'}</td>
                     <td>
                       {manage && !self ? (
                         <select className="select sm" style={{ width: 210 }} value={u.role} disabled={busy} onChange={(e) => update(u, { role: e.target.value })}>
@@ -56,7 +66,13 @@ export default function Access() {
                     <td>{manage && !self
                       ? <input type="checkbox" className="check" checked={!!u.active} disabled={busy} onChange={(e) => update(u, { active: e.target.checked })} aria-label={`Active ${u.name}`} />
                       : (u.active ? 'Yes' : 'No')}</td>
-                    <td className="small muted">{dateTime(u.created_at)}</td>
+                    <td>{u.locked_until ? <Pill tone="bad">Locked</Pill> : u.must_change_password ? <Pill tone="warn">Temporary password</Pill> : u.mfa_enabled ? <Pill tone="good">MFA on</Pill> : <Pill tone="warn">MFA not set up</Pill>}</td>
+                    <td className="small muted">{u.last_login_at ? dateTime(u.last_login_at) : 'Never'}</td>
+                    {manage && <td className="row" style={{ flexWrap: 'nowrap' }}>{!self && <>
+                      {u.locked_until && <Button size="sm" disabled={busy} onClick={() => unlock(u)}>Unlock</Button>}
+                      <Button size="sm" disabled={busy} onClick={() => resetPassword(u)}>Reset password</Button>
+                      {!!u.mfa_enabled && <Button size="sm" disabled={busy} onClick={() => resetMfa(u)}>Reset MFA</Button>}
+                    </>}</td>}
                   </tr>
                 );
               })}
@@ -123,6 +139,13 @@ export default function Access() {
           ) : <div className="muted small">No access changes yet.</div>}
         </Card>
       </div>
+      {temp && (
+        <Modal title={`One-time password for ${temp.user.name}`} onClose={() => setTemp(null)} width={520} footer={<Button variant="primary" onClick={() => setTemp(null)}>Done</Button>}>
+          <p>Give this to <b>{temp.user.name}</b> through a separate channel (phone or in person, never the same email as their username). It is shown only once.</p>
+          <div className="temp-pw"><code>{temp.temporary_password}</code><Button size="sm" onClick={() => navigator.clipboard?.writeText(temp.temporary_password)}>Copy</Button></div>
+          <p className="muted small">They must choose their own password at sign-in. All their sessions were ended.</p>
+        </Modal>
+      )}
     </>
   );
 }

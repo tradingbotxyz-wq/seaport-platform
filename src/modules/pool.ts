@@ -3,6 +3,7 @@
 // Concentration checks, loan selection and stress testing run in the Python engine.
 
 import type { Services, User } from '../core/context.ts';
+import { assertNotRecentlyReset } from '../core/cooldown.ts';
 import { requirePermission, now, nextRef, daysBetween } from '../core/context.ts';
 import * as audit from '../core/audit.ts';
 import { emit } from '../core/outbox.ts';
@@ -116,8 +117,12 @@ function metrics(loans: PoolLoan[]) {
 const engineLoan = (l: PoolLoan) => ({ id: l.id, obligor: l.obligor, program: l.program, country: l.country, rating: l.rating,
   principal_cents: l.principal_cents, outstanding_cents: l.outstanding_cents, yield_bps: l.yield_bps, days: l.days });
 
-async function concentrationFor(svc: Services, pool: any, loans: PoolLoan[]) {
-  const r = await svc.engine.call('/pool/concentration', { loans: loans.filter((l) => l.status === 'OPEN').map(engineLoan), limits: pool.limits, target_size_cents: pool.target_size_cents });
+/**
+ * Concentration on the pool's actual principal. While a DRAFT pool is being filled, additions are
+ * checked against its target size (projected); activation and any change to an ACTIVE pool use actual size.
+ */
+async function concentrationFor(svc: Services, pool: any, loans: PoolLoan[], projected = false) {
+  const r = await svc.engine.call('/pool/concentration', { loans: loans.filter((l) => l.status === 'OPEN').map(engineLoan), limits: pool.limits, target_size_cents: pool.target_size_cents, against_target: projected });
   return r.concentration as { key: string; label: string; limit_bps: number; largest: string; amount_cents: number; bps: number; status: string }[];
 }
 
@@ -262,9 +267,9 @@ export async function addLoans(svc: Services, user: User, id: number, body: any)
   const current = poolLoans(svc, id).filter((l) => l.status === 'OPEN');
   const size = current.concat(loans).reduce((a, l) => a + l.principal_cents, 0);
   if (size > pool.target_size_cents) throw conflict(`Pool would exceed its target size (${(size / 100).toLocaleString('en-US')} > ${(pool.target_size_cents / 100).toLocaleString('en-US')})`);
-  const conc = await concentrationFor(svc, pool, current.concat(loans));
+  const conc = await concentrationFor(svc, pool, current.concat(loans), pool.status === 'DRAFT');
   const breaches = conc.filter((c) => c.status === 'Breach');
-  if (breaches.length && !body?.allow_breach) throw conflict('Adding these loans breaches concentration limits', breaches.map((b) => `${b.label}: ${b.largest} ${(b.bps / 100).toFixed(1)}% > ${(b.limit_bps / 100).toFixed(1)}%`));
+  if (breaches.length && (pool.status !== 'DRAFT' || !body?.allow_breach)) throw conflict(pool.status === 'DRAFT' ? 'Adding these loans breaches concentration limits' : 'An active pool cannot take loans that breach its concentration limits', breaches.map((b) => `${b.label}: ${b.largest} ${(b.bps / 100).toFixed(1)}% > ${(b.limit_bps / 100).toFixed(1)}%`));
   return svc.db.tx(() => {
     for (const l of loans) svc.db.run('INSERT INTO pool_loans (pool_id, loan_id, added_by, added_at) VALUES (?,?,?,?)', [id, l.id, user.username, now()]);
     audit.record(svc.db, user, 'pool.loans_added', 'pool', id, { loans: loans.map((l) => l.loan_ref), principal_cents: loans.reduce((a, l) => a + l.principal_cents, 0) });
@@ -303,6 +308,7 @@ export async function autoBuild(svc: Services, user: User, id: number, apply: bo
 
 export async function activate(svc: Services, user: User, id: number) {
   requirePermission(user, 'pool.activate');
+  assertNotRecentlyReset(svc, user);
   const p = await getPool(svc, id);
   if (p.status !== 'DRAFT') throw conflict(`Pool is ${p.status}`);
   if (p.created_by === user.username) throw forbidden('Four-eyes: a pool must be activated by someone other than the person who built it (SoD-8)');

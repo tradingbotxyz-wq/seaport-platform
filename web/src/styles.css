@@ -393,3 +393,39 @@ i.hatch { background: repeating-linear-gradient(135deg, var(--violet) 0 2px, tra
 .linechart { width: 100%; overflow: hidden; }
 .linechart svg { display: block; }
 @media (max-width: 1100px) { .filters { grid-template-columns: 1fr; gap: 16px; } .grid.g4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+/* ---- Authentication ---- */
+.auth { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px 16px; gap: 14px;
+  background: radial-gradient(1200px 500px at 10% -10%, var(--brand-soft), transparent 60%), var(--bg); }
+.auth-card { width: min(440px, 100%); background: var(--surface); border: 1px solid var(--border); border-radius: 18px; padding: 30px 30px 24px; box-shadow: var(--shadow); }
+.auth-title { font-size: 20px; margin: 22px 0 4px; }
+.auth-sub { color: var(--muted); font-size: 13.5px; margin: 0 0 16px; line-height: 1.5; }
+.auth-form { display: flex; flex-direction: column; gap: 14px; }
+.auth-foot { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); text-align: center; }
+.auth-legal { display: flex; align-items: center; gap: 6px; color: var(--faint); font-size: 12px; margin: 0; }
+.auth .user-btn { width: 100%; display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); cursor: pointer; text-align: left; margin-top: 8px; color: var(--text); }
+.auth .user-btn:hover { border-color: var(--brand); background: var(--brand-soft); }
+.auth .user-btn .avatar { width: 32px; height: 32px; font-size: 13px; }
+.btn.block { width: 100%; justify-content: center; height: 44px; font-size: 14.5px; }
+.link-btn { background: none; border: 0; color: var(--brand-text); cursor: pointer; font-size: 13px; padding: 4px; text-decoration: underline; text-underline-offset: 3px; }
+.pw-wrap { position: relative; }
+.pw-wrap .input { padding-right: 64px; width: 100%; }
+.pw-toggle { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); background: none; border: 0; color: var(--brand-text); cursor: pointer; font-size: 12.5px; font-weight: 600; padding: 6px 8px; }
+.code-input { font-family: var(--mono, ui-monospace, monospace); font-size: 26px; letter-spacing: 0.45em; text-align: center; height: 56px; }
+.code-input.recovery { font-size: 20px; letter-spacing: 0.12em; }
+.steps { padding-left: 20px; margin: 0; display: flex; flex-direction: column; gap: 14px; font-size: 13.5px; line-height: 1.5; }
+.setup-key { margin-top: 8px; border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; background: var(--surface-2); display: flex; flex-direction: column; gap: 6px; }
+.setup-key .kv { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+.setup-key .kv > span { color: var(--muted); width: 64px; flex: none; }
+.setup-key code { font-size: 15px; letter-spacing: 0.06em; word-break: break-all; flex: 1; }
+.setup-key .open-app { align-self: flex-start; }
+.codes { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 6px 0; }
+.codes code { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px; text-align: center; font-size: 15px; letter-spacing: 0.04em; }
+.check-row { margin: 8px 0 14px; font-size: 13.5px; }
+.pw-checks { list-style: none; padding: 0; margin: -4px 0 0; display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); }
+.pw-checks li { display: flex; align-items: center; gap: 6px; }
+.pw-checks li.ok { color: var(--green); }
+.temp-pw { display: flex; align-items: center; gap: 10px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin: 10px 0; }
+.temp-pw code { font-size: 18px; letter-spacing: 0.06em; flex: 1; }
+.tbl tr.changed td { background: color-mix(in srgb, var(--amber) 8%, transparent); }
+.more { margin-top: 12px; } .more summary { cursor: pointer; }

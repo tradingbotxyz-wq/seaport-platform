@@ -9,6 +9,7 @@
 // Calls and payment releases run as sagas (see core/saga.ts) so partial failures are compensated.
 
 import type { Services, User } from '../core/context.ts';
+import { assertNotRecentlyReset } from '../core/cooldown.ts';
 import { requirePermission, now, nextRef, addDays } from '../core/context.ts';
 import * as audit from '../core/audit.ts';
 import { emit } from '../core/outbox.ts';
@@ -18,6 +19,7 @@ import { badRequest, conflict, forbidden, notFound, validation } from '../lib/er
 import * as ledger from './ledger.ts';
 import { generatePdf, storeBytes, recordDocument } from './documents.ts';
 import { pipeline } from './exposure.ts';
+import { requestChange, registerApplier, assertUnchanged } from './approvals.ts';
 
 const TRANCHES = ['SENIOR', 'MEZZANINE', 'EQUITY'];
 
@@ -61,20 +63,31 @@ export function listBankAccounts(svc: Services) {
     FROM bank_accounts b ORDER BY b.owner_type, owner_name, b.currency`).map(maskAccount);
 }
 
-function maskAccount(b: any) {
-  const mask = (s?: string | null) => (s && s.length > 4 ? `••••${s.slice(-4)}` : s);
-  return { ...b, account_number_masked: mask(b.account_number), iban_masked: b.iban ? `${b.iban.slice(0, 4)}••••${b.iban.slice(-4)}` : null };
+/** Full account numbers never leave the server: only the bank file and payment notices carry them. */
+export function maskAccount(b: any) {
+  if (!b) return b;
+  const mask = (s?: string | null) => (s ? (s.length > 4 ? `••••${s.slice(-4)}` : '••••') : s);
+  const { account_number, iban, routing_number, ...rest } = b;
+  return { ...rest, account_number_masked: mask(account_number), iban_masked: iban ? `${iban.slice(0, 4)}••••${iban.slice(-4)}` : null,
+    routing_number_masked: routing_number ? `•••••${routing_number.slice(-4)}` : null, has_account: !!(account_number || iban) };
 }
 
+const BANK_FIELDS = ['owner_type', 'owner_id', 'account_name', 'bank_name', 'routing_number', 'account_number', 'bic', 'iban', 'currency', 'country', 'active'];
+
+/** Bank details are a request: they take effect when a second authorised user approves (SoD-10). */
 export function saveBankAccount(svc: Services, user: User, id: number | null, body: any) {
   requirePermission(user, 'payments.accounts');
-  const input = check<any>(body, {
+  const before = id ? svc.db.get<any>('SELECT * FROM bank_accounts WHERE id = ?', [id]) : null;
+  if (id && !before) throw notFound('Bank account');
+  // Unchanged masked fields come back from the browser as blanks: keep the stored value.
+  const merged = before ? { ...before, active: !!before.active, ...Object.fromEntries(Object.entries(body ?? {}).filter(([, v]) => v !== '' && v !== null && v !== undefined)) } : body;
+  const input = check<any>(merged, {
     owner_type: { type: 'enum', required: true, values: ['SEAPORT', 'PROGRAM', 'INVESTOR'] },
     owner_id: { type: 'int', min: 1 },
-    account_name: { type: 'string', required: true, maxLength: 120 },
-    bank_name: { type: 'string', required: true, maxLength: 120 },
+    account_name: { type: 'string', required: true, maxLength: 120, pattern: /^[A-Za-z0-9 .,&()'\/-]+$/ },
+    bank_name: { type: 'string', required: true, maxLength: 120, pattern: /^[A-Za-z0-9 .,&()'\/-]+$/ },
     routing_number: { type: 'string', pattern: /^\d{9}$/ },
-    account_number: { type: 'string', maxLength: 34 },
+    account_number: { type: 'string', maxLength: 34, pattern: /^[A-Za-z0-9]{4,34}$/ },
     bic: { type: 'string', pattern: BIC_RE },
     iban: { type: 'string', maxLength: 42 },
     currency: { type: 'string', required: true, pattern: /^[A-Z]{3}$/ },
@@ -91,23 +104,32 @@ export function saveBankAccount(svc: Services, user: User, id: number | null, bo
     if (!ibanValid(input.iban)) errors.iban = 'IBAN fails the mod-97 check';
   }
   if (Object.keys(errors).length) throw validation(errors);
-  return svc.db.tx(() => {
-    const ts = now();
-    const vals = [input.owner_type, input.owner_id ?? null, input.account_name, input.bank_name, input.routing_number ?? null, input.account_number ?? null,
-      input.bic ?? null, input.iban ? input.iban.replace(/\s+/g, '').toUpperCase() : null, input.currency, input.country, input.active === false ? 0 : 1];
-    if (id) {
-      const before = svc.db.get('SELECT * FROM bank_accounts WHERE id = ?', [id]);
-      if (!before) throw notFound('Bank account');
-      svc.db.run(`UPDATE bank_accounts SET owner_type=?, owner_id=?, account_name=?, bank_name=?, routing_number=?, account_number=?, bic=?, iban=?, currency=?, country=?, active=?, updated_by=?, updated_at=? WHERE id=?`, [...vals, user.username, ts, id]);
-      audit.record(svc.db, user, 'bank_account.updated', 'bank_account', id, { before: maskAccount(before), after: { ...input, account_number: undefined, iban: undefined } });
-      return { ok: true, id };
-    }
-    const r = svc.db.run(`INSERT INTO bank_accounts (owner_type, owner_id, account_name, bank_name, routing_number, account_number, bic, iban, currency, country, active, created_by, updated_by, created_at, updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [...vals, user.username, user.username, ts, ts]);
-    audit.record(svc.db, user, 'bank_account.created', 'bank_account', r.id, { owner_type: input.owner_type, owner_id: input.owner_id, bank: input.bank_name, currency: input.currency });
-    return { status: 201, json: { id: r.id } };
+  const payload = { ...Object.fromEntries(BANK_FIELDS.map((f) => [f, input[f] ?? null])), iban: input.iban ? input.iban.replace(/\s+/g, '').toUpperCase() : null, active: input.active === false ? 0 : 1 };
+  return requestChange(svc, user, {
+    kind: id ? 'BANK_ACCOUNT_UPDATE' : 'BANK_ACCOUNT_CREATE', entity_type: 'bank_account', entity_id: id,
+    summary: `${id ? 'Change' : 'New'} ${payload.owner_type.toLowerCase()} bank account "${payload.account_name}" at ${payload.bank_name} (${payload.currency}), ${payload.iban ? `IBAN ••••${String(payload.iban).slice(-4)}` : `account ••••${String(payload.account_number ?? '').slice(-4)}`}`,
+    payload, before: before ? Object.fromEntries(BANK_FIELDS.map((f) => [f, before[f]])) : undefined, reason: body?.reason,
   });
 }
+
+registerApplier('BANK_ACCOUNT_CREATE', (svc, approver, cr, p) => {
+  const ts = now();
+  const r = svc.db.run(`INSERT INTO bank_accounts (owner_type, owner_id, account_name, bank_name, routing_number, account_number, bic, iban, currency, country, active, created_by, updated_by, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [...BANK_FIELDS.map((f) => p[f] ?? null), cr.requested_by, approver.username, ts, ts]);
+  audit.record(svc.db, approver, 'bank_account.created', 'bank_account', r.id, { ...maskAccount(p), requested_by: cr.requested_by, change_request: cr.ref });
+  return { id: r.id };
+});
+
+registerApplier('BANK_ACCOUNT_UPDATE', (svc, approver, cr, p) => {
+  const id = Number(cr.entity_id);
+  const before = svc.db.get<any>('SELECT * FROM bank_accounts WHERE id = ?', [id]);
+  if (!before) throw notFound('Bank account');
+  assertUnchanged(before, cr, BANK_FIELDS);
+  svc.db.run(`UPDATE bank_accounts SET owner_type=?, owner_id=?, account_name=?, bank_name=?, routing_number=?, account_number=?, bic=?, iban=?, currency=?, country=?, active=?, updated_by=?, updated_at=? WHERE id=?`,
+    [...BANK_FIELDS.map((f) => p[f] ?? null), cr.requested_by, now(), id]);
+  audit.record(svc.db, approver, 'bank_account.updated', 'bank_account', id, { before: maskAccount(before), after: maskAccount(p), requested_by: cr.requested_by, change_request: cr.ref });
+  return { id };
+});
 
 // ---------- Commitments ----------
 
@@ -117,10 +139,19 @@ function commitmentRows(svc: Services, where = '1=1', params: any[] = []) {
       COALESCE((SELECT SUM(l.amount_cents) FROM capital_call_lines l JOIN capital_calls cc ON cc.id = l.call_id WHERE l.commitment_id = c.id AND cc.status IN ('ISSUED','SETTLED')), 0) AS called_cents,
       COALESCE((SELECT SUM(l.received_cents) FROM capital_call_lines l WHERE l.commitment_id = c.id), 0) AS paid_in_cents,
       COALESCE((SELECT SUM(d.amount_cents) FROM distribution_lines d JOIN distributions x ON x.id = d.distribution_id WHERE d.commitment_id = c.id AND x.status IN ('APPROVED','PAID') AND x.kind = 'CAPITAL'), 0) AS returned_capital_cents,
-      COALESCE((SELECT SUM(d.amount_cents) FROM distribution_lines d JOIN distributions x ON x.id = d.distribution_id WHERE d.commitment_id = c.id AND x.status IN ('APPROVED','PAID') AND x.kind = 'INCOME'), 0) AS income_cents
+      COALESCE((SELECT SUM(d.amount_cents) FROM distribution_lines d JOIN distributions x ON x.id = d.distribution_id WHERE d.commitment_id = c.id AND x.status IN ('APPROVED','PAID') AND x.kind = 'INCOME'), 0) AS income_cents,
+      COALESCE((SELECT SUM(l.amount_cents) FROM capital_call_lines l JOIN capital_calls cc ON cc.id = l.call_id WHERE l.commitment_id = c.id AND cc.status = 'DRAFT'), 0) AS draft_called_cents,
+      COALESCE((SELECT SUM(d.amount_cents) FROM distribution_lines d JOIN distributions x ON x.id = d.distribution_id WHERE d.commitment_id = c.id AND x.status = 'DRAFT' AND x.kind = 'CAPITAL'), 0) AS draft_returned_cents
     FROM commitments c JOIN investors i ON i.id = c.investor_id JOIN pools p ON p.id = c.pool_id
     WHERE ${where} ORDER BY p.id, CASE c.tranche WHEN 'SENIOR' THEN 0 WHEN 'MEZZANINE' THEN 1 ELSE 2 END, c.amount_cents DESC`, params)
-    .map((c) => ({ ...c, unfunded_cents: c.status === 'ACTIVE' ? c.amount_cents - c.called_cents : 0, nav_cents: c.paid_in_cents - c.returned_capital_cents }));
+    .map((c) => ({
+      ...c,
+      unfunded_cents: c.status === 'ACTIVE' ? c.amount_cents - c.called_cents : 0,
+      // Still callable once draft calls are counted: what a new call may use.
+      callable_cents: c.status === 'ACTIVE' ? Math.max(c.amount_cents - c.called_cents - c.draft_called_cents, 0) : 0,
+      nav_cents: c.paid_in_cents - c.returned_capital_cents,
+      returnable_cents: Math.max(c.paid_in_cents - c.returned_capital_cents - c.draft_returned_cents, 0),
+    }));
 }
 
 export function listCommitments(svc: Services, query: URLSearchParams) {
@@ -190,10 +221,10 @@ export function createCall(svc: Services, user: User, body: unknown) {
   if (pool.status !== 'ACTIVE') throw conflict('Capital can only be called for an active pool');
   const cms = commitmentRows(svc, "c.pool_id = ? AND c.tranche = ? AND c.status = 'ACTIVE'", [pool.id, input.tranche]);
   if (!cms.length) throw conflict(`No active ${input.tranche} commitments in ${pool.ref}`);
-  const unfunded = cms.reduce((a, c) => a + c.unfunded_cents, 0);
-  if (input.amount_cents > unfunded) throw conflict(`Amount exceeds unfunded commitments (${(unfunded / 100).toLocaleString('en-US')} ${pool.currency})`);
+  const unfunded = cms.reduce((a, c) => a + c.callable_cents, 0);
+  if (input.amount_cents > unfunded) throw conflict(`Amount exceeds commitments still callable after draft calls (${(unfunded / 100).toLocaleString('en-US')} ${pool.currency})`);
   const alloc = proRata(input.amount_cents, cms.map((c) => c.amount_cents));
-  const over = cms.filter((c, i) => alloc[i] > c.unfunded_cents);
+  const over = cms.filter((c, i) => alloc[i] > c.callable_cents);
   if (over.length) throw conflict('Pro-rata allocation exceeds some investors\' unfunded commitment', over.map((c) => `${c.investor_name}: unfunded ${(c.unfunded_cents / 100).toLocaleString('en-US')}`));
   return svc.db.tx(() => {
     const ref = nextRef(svc.db, 'CC', 5);
@@ -207,6 +238,7 @@ export function createCall(svc: Services, user: User, body: unknown) {
 
 export async function issueCall(svc: Services, user: User, id: number) {
   requirePermission(user, 'fund.approve');
+  assertNotRecentlyReset(svc, user);
   const call = getCall(svc, id);
   if (call.status !== 'DRAFT') throw conflict(`Capital call is ${call.status}`);
   if (call.created_by === user.username) throw forbidden('Four-eyes: a capital call must be approved by someone other than its preparer (SoD-9)');
@@ -215,6 +247,13 @@ export async function issueCall(svc: Services, user: User, id: number) {
     {
       name: 'Approve call and post receivable',
       run: () => svc.db.tx(() => {
+        // Re-check every line against what is still unfunded, counting only issued calls.
+        for (const l of call.lines) {
+          const c = commitmentRows(svc, 'c.id = ?', [l.commitment_id])[0];
+          if (!c || c.status !== 'ACTIVE' || l.amount_cents > c.unfunded_cents) {
+            throw conflict(`${l.investor_code}: the call (${(l.amount_cents / 100).toLocaleString('en-US')}) exceeds the unfunded commitment (${((c?.unfunded_cents ?? 0) / 100).toLocaleString('en-US')})`);
+          }
+        }
         const r = svc.db.run("UPDATE capital_calls SET status = 'ISSUED', approved_by = ?, issued_at = ? WHERE id = ? AND status = 'DRAFT'", [user.username, now(), id]);
         if (r.changes !== 1) throw conflict('Capital call changed');
         ctx.entryId = ledger.post(svc.db, user, {
@@ -325,11 +364,16 @@ export function createDistributionInternal(svc: Services, user: User, body: any)
   if (!pool) throw badRequest('Unknown pool');
   const cms = commitmentRows(svc, "c.pool_id = ? AND c.tranche = ? AND c.status = 'ACTIVE'", [pool.id, input.tranche]).filter((c) => c.nav_cents > 0 && (!only || c.id === only));
   if (!cms.length) throw conflict('No paid-in capital in this tranche to distribute against');
-  if (input.kind === 'CAPITAL') {
-    const nav = cms.reduce((a, c) => a + c.nav_cents, 0);
-    if (input.amount_cents > nav) throw conflict(`Return of capital exceeds net paid-in capital (${(nav / 100).toLocaleString('en-US')})`);
-  }
   const alloc = proRata(input.amount_cents, cms.map((c) => c.nav_cents));
+  if (input.kind === 'CAPITAL') {
+    const nav = cms.reduce((a, c) => a + c.returnable_cents, 0);
+    if (input.amount_cents > nav) throw conflict(`Return of capital exceeds net paid-in capital after draft distributions (${(nav / 100).toLocaleString('en-US')})`);
+    const over = cms.filter((c, i) => alloc[i] > c.returnable_cents);
+    if (over.length) throw conflict('Pro-rata return exceeds some investors\' net paid-in capital', over.map((c) => c.investor_code));
+  } else {
+    const available = incomeAvailable(svc, pool.id);
+    if (input.amount_cents > available) throw conflict(`Income distribution exceeds income the pool has earned and not yet distributed (${(available / 100).toLocaleString('en-US')} ${pool.currency})`);
+  }
   return svc.db.tx(() => {
     const ref = nextRef(svc.db, 'DIST', 5);
     const { id } = svc.db.run(`INSERT INTO distributions (ref, pool_id, tranche, currency, kind, amount_cents, payment_date, status, created_by, created_at) VALUES (?,?,?,?,?,?,?, 'DRAFT', ?, ?)`,
@@ -340,20 +384,52 @@ export function createDistributionInternal(svc: Services, user: User, body: any)
   });
 }
 
+/**
+ * Income a pool can distribute: interest earned to date on its loans (in full once settled,
+ * accrued day by day while open), less income already distributed or in draft (all tranches).
+ * Prevents paying out income the pool has not earned.
+ */
+function incomeAvailable(svc: Services, poolId: number, excludeDistribution = 0) {
+  const today = svc.today();
+  const earned = svc.db.all<any>(`SELECT l.status, l.interest_cents, l.funding_date, l.maturity_date FROM pool_loans pl JOIN loans l ON l.id = pl.loan_id
+    WHERE pl.pool_id = ? AND pl.removed_at IS NULL`, [poolId]).reduce((a, l) => {
+    if (l.status === 'SETTLED') return a + l.interest_cents;
+    const tenor = Math.max(1, (Date.parse(l.maturity_date) - Date.parse(l.funding_date)) / 864e5);
+    const elapsed = Math.min(Math.max(0, (Date.parse(today) - Date.parse(l.funding_date)) / 864e5), tenor);
+    return a + Math.floor((l.interest_cents * elapsed) / tenor);
+  }, 0);
+  const distributed = svc.db.get<{ s: number }>(`SELECT COALESCE(SUM(amount_cents), 0) s FROM distributions
+    WHERE pool_id = ? AND kind = 'INCOME' AND status IN ('DRAFT','APPROVED','PAID') AND id <> ?`, [poolId, excludeDistribution])!.s;
+  return Math.max(earned - distributed, 0);
+}
+
 export function approveDistribution(svc: Services, user: User, id: number) {
   requirePermission(user, 'fund.approve');
+  assertNotRecentlyReset(svc, user);
   const d = svc.db.get('SELECT d.*, p.ref AS pool_ref FROM distributions d JOIN pools p ON p.id = d.pool_id WHERE d.id = ?', [id]);
   if (!d) throw notFound('Distribution');
   if (d.status !== 'DRAFT') throw conflict(`Distribution is ${d.status}`);
   if (d.created_by === user.username) throw forbidden('Four-eyes: a distribution must be approved by someone other than its preparer (SoD-9)');
   const lines = svc.db.all('SELECT l.*, i.code, i.name FROM distribution_lines l JOIN investors i ON i.id = l.investor_id WHERE distribution_id = ?', [id]);
   return svc.db.tx(() => {
+    // Re-check limits at approval, counting only approved and paid distributions.
+    if (d.kind === 'CAPITAL') {
+      for (const l of lines) {
+        const c = commitmentRows(svc, 'c.id = ?', [l.commitment_id])[0];
+        if (!c || l.amount_cents > c.nav_cents) throw conflict(`${l.code}: return of capital exceeds net paid-in capital (${((c?.nav_cents ?? 0) / 100).toLocaleString('en-US')})`);
+      }
+    } else {
+      const available = incomeAvailable(svc, d.pool_id, id);
+      if (d.amount_cents > available) throw conflict(`Income distribution exceeds undistributed income (${(available / 100).toLocaleString('en-US')} ${d.currency})`);
+    }
     const debit = d.kind === 'CAPITAL' ? '3000' : '2300';
     const je = ledger.post(svc.db, user, {
       date: d.payment_date, description: `Distribution ${d.ref} (${d.kind.toLowerCase()}) ${d.pool_ref} ${d.tranche}`, source_type: 'DISTRIBUTION', source_id: id, currency: d.currency,
       lines: [...lines.map((l) => ({ account: debit, debit: l.amount_cents, investor_id: l.investor_id })), ...lines.map((l) => ({ account: '2600', credit: l.amount_cents, investor_id: l.investor_id }))],
     });
-    svc.db.run("UPDATE distributions SET status = 'APPROVED', approved_by = ?, approved_at = ?, journal_entry_id = ? WHERE id = ?", [user.username, now(), je, id]);
+    if (svc.db.run("UPDATE distributions SET status = 'APPROVED', approved_by = ?, approved_at = ?, journal_entry_id = ? WHERE id = ? AND status = 'DRAFT'", [user.username, now(), je, id]).changes !== 1) {
+      throw conflict('Distribution changed');
+    }
     for (const l of lines) {
       if (!l.amount_cents) continue;
       svc.db.run(`INSERT INTO payments (purpose, source_type, source_id, beneficiary_account_id, beneficiary_name, amount_cents, currency, reference, status, created_at)
@@ -445,11 +521,16 @@ export async function previewBatch(svc: Services, id: number) {
 
 export async function approveBatch(svc: Services, user: User, id: number) {
   requirePermission(user, 'payments.approve');
+  assertNotRecentlyReset(svc, user);
   const b = getBatch(svc, id);
   if (b.status !== 'DRAFT') throw conflict(`Batch is ${b.status}`);
   if (b.created_by === user.username) throw forbidden('Four-eyes: a disbursement batch must be approved by someone other than its preparer (SoD-10)');
-  const changed = svc.db.all(`SELECT DISTINCT ba.account_name FROM payments pm JOIN bank_accounts ba ON ba.id = pm.beneficiary_account_id WHERE pm.batch_id = ? AND (ba.updated_by = ? OR ba.created_by = ?)`, [id, user.username, user.username]);
-  if (changed.length) throw forbidden(`SoD-10: you created or changed bank details for ${changed.map((c) => c.account_name).join(', ')} - another approver is required`);
+  // Anyone who requested or approved bank details used in this batch (at any time) cannot approve it.
+  const changed = svc.db.all(`SELECT DISTINCT ba.account_name FROM payments pm JOIN bank_accounts ba ON ba.id = pm.beneficiary_account_id
+    WHERE pm.batch_id = ? AND (ba.created_by = ? OR ba.updated_by = ? OR EXISTS (SELECT 1 FROM change_requests cr WHERE cr.entity_type = 'bank_account'
+      AND cr.status = 'APPLIED' AND (cr.requested_by = ? OR cr.decided_by = ?) AND (cr.entity_id = CAST(ba.id AS TEXT) OR (cr.kind = 'BANK_ACCOUNT_CREATE' AND ba.created_by = cr.requested_by))))`,
+    [id, user.username, user.username, user.username, user.username]);
+  if (changed.length) throw forbidden(`SoD-10: you requested or approved bank details for ${changed.map((c) => c.account_name).join(', ')} - another approver is required`);
   const ctx: { file?: any; docId?: number } = {};
   const result = await runSaga(svc, user, 'payment_batch.approve', b.ref, ctx, [
     {
@@ -481,6 +562,7 @@ export async function approveBatch(svc: Services, user: User, id: number) {
 /** Mark the batch as transmitted to the bank: cash leaves account 1000. */
 export async function releaseBatch(svc: Services, user: User, id: number) {
   requirePermission(user, 'payments.approve');
+  assertNotRecentlyReset(svc, user);
   const b = getBatch(svc, id);
   if (b.status !== 'APPROVED') throw conflict(`Batch is ${b.status}; approve it first`);
   const ctx: { entries: number[] } = { entries: [] };
@@ -509,8 +591,9 @@ export async function releaseBatch(svc: Services, user: User, id: number) {
 export function cancelBatch(svc: Services, user: User, id: number) {
   requirePermission(user, 'payments.prepare');
   return svc.db.tx(() => {
-    const r = svc.db.run("UPDATE payment_batches SET status = 'CANCELLED' WHERE id = ? AND status IN ('DRAFT','APPROVED')", [id]);
-    if (!r.changes) throw conflict('Only draft or approved (not yet sent) batches can be cancelled');
+    // Once approved, a bank file exists: cancelling and re-batching could pay twice. Recall happens at the bank.
+    const r = svc.db.run("UPDATE payment_batches SET status = 'CANCELLED' WHERE id = ? AND status = 'DRAFT'", [id]);
+    if (!r.changes) throw conflict('Only draft batches can be cancelled. An approved batch has a bank file: recall it with the bank, then record the outcome.');
     svc.db.run('UPDATE payments SET batch_id = NULL WHERE batch_id = ?', [id]);
     audit.record(svc.db, user, 'payment_batch.cancelled', 'payment_batch', id, {});
     return { ok: true };

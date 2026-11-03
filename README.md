@@ -41,26 +41,31 @@ Then open **http://localhost:3000**. The first start loads demo data, with dates
 |---|---|
 | `npm start` | Start the Python engine and the Node API + UI on port 3000 |
 | `npm run reset` | Delete the database and uploaded files, then reload demo data |
-| `npm test` | End-to-end API tests (real Node API + real Python engine) |
+| `npm test` | End-to-end API and security tests (real Node API + real Python engine) |
+| `npm run admin -- <command>` | Accounts from the command line: `create-user`, `reset-password`, `reset-mfa`, `unlock`, `list-users` |
 | `npm run test:engine` | Python unit tests (pricing, parsing) |
 | `npm run build:web` | Rebuild the React UI after editing `web/src` (see below) |
 
 Settings (environment variables): `PORT` (3000), `HOST` (127.0.0.1), `ENGINE_PORT` (8001), `DB_PATH` (`data/seaport.db`), `FILES_DIR` (`data/files`), `BUSINESS_DATE` (override "today", e.g. `2026-09-21`), `PYTHON` (path to python.exe if it is not on PATH).
 
-## Demo users (local sign-in)
+## Sign-in and demo users
 
-Pick a user on the sign-in screen. Each role sees and can do different things, and the API enforces it.
+Sign in with a username and password. On a laptop the demo users share the password **`Seaport#Demo2026`**, which is also printed when the server starts. Two-step verification (an authenticator app) is optional on a laptop (*Profile → Turn on*) and **required on servers** (`NODE_ENV=production`). Each role sees and can do different things, and the API enforces it. Security details: [docs/SECURITY.md](docs/SECURITY.md).
 
-| User | Role | Typical actions |
+| Username | Role | Typical actions |
 |---|---|---|
-| Seaport Administrator | Admin | Everything; manages users |
-| Rabuan | Operations – maker | Uploads invoice and settlement files |
-| Priya Nair | Operations – checker | Reviews and **approves funding** (four-eyes vs uploader) |
-| Daniel Okafor | Credit | Edits programs, obligors, limits, pricing |
-| Meera Shah / Tom Reyes | Treasury | Uploads bank statements / **posts cash** (four-eyes) |
-| Internal Audit | Read only | Views everything |
+| `admin` | Administrator | Requests user and role changes, resets passwords and MFA; credit committee for above-authority limits. **Cannot move money** |
+| `rabuan` | Operations – maker | Uploads invoice and settlement files, tags investors, requests bank-detail changes |
+| `priya` | Operations – checker | Reviews and **approves funding** (four-eyes vs uploader and editors) |
+| `daniel`, `sara` | Credit | Request and approve (each other's) limit and pricing changes; decide credit applications |
+| `meera`, `tom` | Treasury | Bank statements, **cash posting**, payments; request / approve FX and fixings |
+| `olivia` | Portfolio manager | Pools, commitments, capital calls, distributions |
+| `lucas` | Trader | Client orders (Brokerage) |
+| `kenji` | Compliance | Approves bank details, brokers and access changes; regulatory exports |
+| `pemberton` | Investor | Investor portal only (own positions and documents) |
+| `audit` | Read only | Views everything; no changes |
 
-**Try the main flow:** as **Priya**, open *Purchase & Funding*. Select the Harborview batch and note it is *Blocked – limit breach*. Reject INV-88244 (Harborview Retail is at 104% of limit), tag an investor on INV-88232, then **Approve funding**. Next, as **Tom**, open *Reconciliation* and **Post matched cash**. The loans become *Settled* on *Settlement & Repayment*, and the ledger and revenue update.
+**Try the main flow:** as **Rabuan**, open *Purchase & Funding*, select the Harborview batch and tag an investor on INV-88232. Then as **Priya**: the batch is *Blocked – limit breach*; reject INV-88244 (Harborview Retail is at 104% of limit), then **Approve funding**. (A checker who restores invoices, tags investors or changes the date cannot approve that file.) Next, as **Tom**, open *Reconciliation* and **Post matched cash**. The loans become *Settled* on *Settlement & Repayment*, and the ledger and revenue update.
 
 ## Screens
 
@@ -121,6 +126,6 @@ The code is structured so each local piece maps to a managed service:
 * Python engine → Lambda or ECS service behind a private endpoint (same JSON contracts)
 * `data/files` → S3 with Object Lock; audit-log exports to S3
 * Outbox dispatcher → EventBridge; notifications → SES/SNS
-* Demo sign-in (`X-User` header) → Cognito / Entra ID SSO with the same role model
+* Password + TOTP MFA sessions → optionally federated to Cognito / Entra ID SSO with the same role model
 
-Still needed for production: real SSO, bank and payment-rail integrations, a holiday calendar per currency, pen-testing and UAT.
+Still needed for production: real KYC/bureau/market-data providers, bank and payment-rail integrations, a holiday calendar per currency, pen-testing and UAT.

@@ -5,6 +5,8 @@ import './styles.css';
 import { get, setApiUser, navigate, useLocation, useApi, useDebounced, useOutsideClick, initials, money, dateShort, moneyExact, post } from './lib.js';
 import { Icon, UiProvider, Modal, Loading, ErrorBox, Pill, Button, useUi, useAction } from './ui.jsx';
 import Dashboard from './pages/Dashboard.jsx';
+import Approvals from './pages/Approvals.jsx';
+import { AuthFlow, Brand, IdleWarning } from './pages/Auth.jsx';
 import Onboarding from './pages/Onboarding.jsx';
 import Underwriting from './pages/Underwriting.jsx';
 import Pools from './pages/Pools.jsx';
@@ -20,7 +22,7 @@ import MasterTable from './pages/MasterTable.jsx';
 import Access from './pages/Access.jsx';
 import Revenue from './pages/Revenue.jsx';
 import Reconciliation from './pages/Reconciliation.jsx';
-import Profile from './pages/Profile.jsx';
+import Profile, { SecurityPanel } from './pages/Profile.jsx';
 
 const ROUTES = [
   { path: '/dashboard', label: 'Portfolio Dashboard', icon: 'home', Page: Dashboard },
@@ -39,11 +41,18 @@ const ROUTES = [
   { path: '/reports', label: 'Reports & Analytics', icon: 'chart', Page: Reports },
   { path: '/revenue', label: 'Revenue & Fees', icon: 'chart', Page: Revenue },
   { section: 'Administration' },
+  { path: '/approvals', label: 'Approvals', icon: 'check', Page: Approvals, badge: 'approvals' },
   { path: '/master-table', label: 'Master Table (Programs)', icon: 'folder', Page: MasterTable },
   { path: '/access', label: 'User Access & SoD', icon: 'users', Page: Access },
   { path: '/profile', label: 'Profile', icon: 'profile', Page: Profile },
 ];
-const INVESTOR_ROUTES = [{ section: 'Investor portal' }, { path: '/portal', label: 'My portfolio', icon: 'home', Page: Portal }];
+const INVESTOR_ROUTES = [{ section: 'Investor portal' }, { path: '/portal', label: 'My portfolio', icon: 'home', Page: Portal }, { path: '/security', label: 'Security', icon: 'shield', Page: InvestorSecurity }];
+
+function InvestorSecurity() {
+  const { data, error } = useApi('/api/me');
+  if (error) return <ErrorBox error={error} />;
+  return data ? <SecurityPanel profile={data} /> : <Loading />;
+}
 
 // ---------- Session ----------
 const store = {
@@ -51,17 +60,15 @@ const store = {
   set: (k, v) => { try { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch { /* storage unavailable */ } },
 };
 
-function Login({ onLogin }) {
+/** Demo mode only (AUTH_MODE=demo, never in production): pick a user to act as. */
+function DemoLogin({ onLogin }) {
   const { data: users, error } = useApi('/api/users');
   return (
-    <div className="login">
-      <div className="panel">
+    <div className="auth">
+      <div className="auth-card">
         <Brand />
-        <h2 style={{ fontSize: 18, marginTop: 22 }}>Sign in</h2>
-        <p className="muted small" style={{ margin: '4px 0 12px' }}>
-          Local demo sign-in: pick a user to act as. Each role sees and can do different things (maker, checker, credit, treasury).
-          In production this is replaced by single sign-on.
-        </p>
+        <h2 className="auth-title">Demo sign-in</h2>
+        <div className="error-box" style={{ marginBottom: 10 }}>Demo mode: anyone can act as any user. Never expose this to a network.</div>
         <ErrorBox error={error} />
         {!users && !error && <Loading />}
         {users?.map((u) => (
@@ -71,16 +78,6 @@ function Login({ onLogin }) {
           </button>
         ))}
       </div>
-    </div>
-  );
-}
-
-function Brand({ collapsed }) {
-  if (collapsed) return <div className="brand-name serif" style={{ fontSize: 22 }}><b>S</b><span className="g">G</span></div>;
-  return (
-    <div className="brand-text">
-      <div className="brand-name">Seaport<b><span className="g">G</span>lobal</b></div>
-      <div className="brand-sub">WORKING CAPITAL</div>
     </div>
   );
 }
@@ -191,7 +188,7 @@ function Search({ openLoan }) {
 }
 
 // ---------- Shell ----------
-function Shell({ session, onLogout }) {
+function Shell({ session, onLogout, idleMinutes }) {
   const loc = useLocation();
   const investor = session.me.role === 'INVESTOR';
   const routes = investor ? INVESTOR_ROUTES : ROUTES;
@@ -200,14 +197,17 @@ function Shell({ session, onLogout }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [theme, setTheme] = useState(() => store.get('sg.theme') || 'light');
   const [loanId, setLoanId] = useState(null);
-  const { data: dash, reload: reloadBadges } = useApi(investor ? null : `/api/dashboard?b=${loc.path}`);
+  const { data: dash, reload: reloadDash } = useApi(investor ? null : `/api/dashboard?b=${loc.path}`);
+  const { data: approvals, reload: reloadApprovals } = useApi(investor ? null : `/api/approvals?status=PENDING&b=${loc.path}`);
+  const reloadBadges = useCallback(() => { reloadDash(); reloadApprovals(); }, [reloadDash, reloadApprovals]);
 
   useEffect(() => { if (!route) navigate(investor ? '/portal' : '/dashboard', { replace: true }); }, [route, investor]);
   useEffect(() => { document.documentElement.dataset.theme = theme; store.set('sg.theme', theme); }, [theme]);
   useEffect(() => { store.set('sg.sidebar', collapsed ? 'collapsed' : null); }, [collapsed]);
   useEffect(() => { setMobileOpen(false); document.title = `${route?.label ?? 'Seaport Global'} · Seaport Global`; }, [route]);
 
-  const badges = { funding: dash?.kpis.files_awaiting_approval, recon: dash?.kpis.recon_breaks, credit: dash?.kpis.credit_awaiting_decision, cases: dash?.kpis.cases_attention };
+  const badges = { funding: dash?.kpis.files_awaiting_approval, recon: dash?.kpis.recon_breaks, credit: dash?.kpis.credit_awaiting_decision, cases: dash?.kpis.cases_attention,
+    approvals: (approvals ?? []).filter((a) => a.can_approve).length };
   const ctx = useMemo(() => ({ ...session, openLoan: setLoanId, refreshBadges: reloadBadges }), [session, reloadBadges]);
   if (!route) return null;
   const { Page } = route;
@@ -260,38 +260,76 @@ function Shell({ session, onLogout }) {
         </div>
       </div>
       {loanId && <LoanModal id={loanId} onClose={() => setLoanId(null)} />}
+      {idleMinutes ? <IdleWarning idleMinutes={idleMinutes} onExpired={onLogout} /> : null}
     </SessionContext.Provider>
   );
 }
 
 function App() {
-  const [username, setUsername] = useState(() => store.get('sg.user'));
+  const [config, setConfig] = useState(null); // { mode, mfa_required, idle_minutes }
+  const [auth, setAuth] = useState(null); // /api/auth/session result
+  const [demoUser, setDemoUser] = useState(() => store.get('sg.user'));
   const [session, setSession] = useState(null);
+  const [notice, setNotice] = useState(null);
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    setApiUser(username);
+    get('/api/auth/config').then(setConfig, setError);
+  }, []);
+
+  // Password mode: discover the session the cookie carries (if any).
+  const refreshAuth = useCallback(() => get('/api/auth/session').then(setAuth, setError), []);
+  useEffect(() => { if (config?.mode === 'password') refreshAuth(); }, [config, refreshAuth]);
+
+  // Anything the server rejects as expired / incomplete sends the user back through sign-in.
+  useEffect(() => {
+    const onOut = (e) => {
+      if (config?.mode !== 'password') return;
+      setSession(null);
+      if (e.detail?.reason === 'expired') setNotice('Your session ended. Please sign in again.');
+      refreshAuth();
+    };
+    window.addEventListener('sg:signed-out', onOut);
+    return () => window.removeEventListener('sg:signed-out', onOut);
+  }, [config, refreshAuth]);
+
+  const ready = config?.mode === 'demo' ? !!demoUser : auth?.authenticated && auth.state === 'ACTIVE';
+  const who = config?.mode === 'demo' ? demoUser : auth?.user?.username;
+  useEffect(() => {
+    setApiUser(config?.mode === 'demo' ? demoUser : null);
     setSession(null);
-    setError(null);
-    if (!username) return;
+    if (!ready) return;
     Promise.all([get('/api/me'), get('/api/health')]).then(([me, health]) => {
       const granted = new Set(me.permissions.filter((p) => p.granted).map((p) => p.key));
-      setSession({ me, today: health.today, engine: health.engine, can: (p) => granted.has(p) });
+      setSession({ me, today: me.today, engine: health.engine, can: (p) => granted.has(p) });
     }, (e) => {
-      if (e.status === 401) { store.set('sg.user', null); setUsername(null); } else setError(e);
+      if (e.status === 401) { store.set('sg.user', null); setDemoUser(null); } else setError(e);
     });
-  }, [username]);
+  }, [ready, who, config, demoUser]);
 
-  const login = (u) => { store.set('sg.user', u); setUsername(u); navigate('/'); };
-  const logout = () => { store.set('sg.user', null); setUsername(null); };
+  const onAuth = (next) => {
+    setNotice(next?.notice ?? null);
+    setAuth(next?.authenticated === false ? { authenticated: false } : next);
+    if (next?.state === 'ACTIVE') navigate('/');
+  };
+  const logout = useCallback(async () => {
+    if (config?.mode === 'demo') { store.set('sg.user', null); setDemoUser(null); return; }
+    try { await post('/api/auth/logout'); } catch { /* already signed out */ }
+    setSession(null);
+    setAuth({ authenticated: false });
+    setNotice('You have signed out.');
+  }, [config]);
 
-  if (!username) return <Login onLogin={login} />;
-  if (error) return <div className="login"><div className="panel"><ErrorBox error={error} /></div></div>;
+  if (error) return <div className="auth"><div className="auth-card"><ErrorBox error={error} /></div></div>;
+  if (!config) return <Loading />;
+  if (config.mode === 'demo' && !demoUser) return <DemoLogin onLogin={(u) => { store.set('sg.user', u); setDemoUser(u); navigate('/'); }} />;
+  if (config.mode === 'password' && !auth) return <Loading />;
+  if (config.mode === 'password' && !ready) return <AuthFlow session={auth} notice={notice} onSession={onAuth} />;
   if (!session) return <Loading />;
   return (
     <>
-      {session.engine !== 'ok' && <div className="error-box" style={{ borderRadius: 0 }}>The Python analytics engine is not running - file uploads and pricing will fail. Restart with "npm start".</div>}
-      <Shell session={session} onLogout={logout} />
+      {session.engine !== 'ok' && <div className="error-box" style={{ borderRadius: 0 }}>The analytics engine is not available - file uploads and pricing will fail until it is back.</div>}
+      <Shell session={session} onLogout={logout} idleMinutes={config.mode === 'password' ? config.idle_minutes : 0} />
     </>
   );
 }

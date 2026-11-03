@@ -45,9 +45,14 @@ def _loans(loans):
     return loans
 
 
-def concentration(loans, limits, target_cents):
-    """Current concentration vs limits, measured on principal against max(target, current size)."""
-    base = max(target_cents, sum(l["principal_cents"] for l in loans)) or 1
+def concentration(loans, limits, target_cents, against_target=False):
+    """Current concentration vs limits, measured on principal against the pool's ACTUAL size.
+
+    Measuring against the target size would let a small pool hold one obligor at 100% and report it
+    as 10%, so the target is ignored here (it only guides selection in select()).
+    """
+    size = sum(l["principal_cents"] for l in loans)
+    base = (max(target_cents, size) if against_target else size) or 1
     out = []
 
     def agg(key):
@@ -61,7 +66,7 @@ def concentration(loans, limits, target_cents):
               ("max_country_bps", "Single country", agg("country"))]
     for key, label, groups in checks:
         lim = limits.get(key)
-        if not lim:
+        if lim is None:  # 0 is a real limit (nothing allowed), only a missing limit is skipped
             continue
         name, amt = max(groups.items(), key=lambda kv: kv[1]) if groups else ("—", 0)
         bps = round(amt * 10000 / base)
@@ -97,12 +102,30 @@ def select(body):
             skipped.append({"id": c["id"], "reason": "would exceed target size"})
             continue
         trial = pool + chosen + [c]
-        breaches = [x for x in concentration(trial, limits, target) if x["status"] == "Breach"]
+        breaches = [x for x in concentration(trial, limits, target, against_target=True) if x["status"] == "Breach"]
         if breaches:
             skipped.append({"id": c["id"], "reason": f"{breaches[0]['label']} limit ({breaches[0]['largest']})"})
             continue
         chosen.append(c)
         size += c["principal_cents"]
+    # If the pool could not be filled to target, limits measured on the ACTUAL size may now be
+    # breached: trim the largest newly chosen loan of the offending group until they all hold.
+    keys = {"max_obligor_bps": "obligor", "max_program_bps": "program", "max_country_bps": "country"}
+    while chosen:
+        breaches = [x for x in concentration(pool + chosen, limits, target) if x["status"] == "Breach"]
+        if not breaches:
+            break
+        b = breaches[0]
+        if b["key"] == "max_sub_ig_bps":
+            group = [c for c in chosen if c["rating"] in SUB_IG]
+        else:
+            group = [c for c in chosen if c[keys[b["key"]]] == b["largest"]]
+        if not group:
+            break  # breach comes from loans already in the pool: nothing selected can fix it
+        drop = max(group, key=lambda c: c["principal_cents"])
+        chosen.remove(drop)
+        size -= drop["principal_cents"]
+        skipped.append({"id": drop["id"], "reason": f"{b['label']} limit on actual pool size ({b['largest']})"})
     return {"selected": [c["id"] for c in chosen], "skipped": skipped, "size_cents": size,
             "concentration": concentration(pool + chosen, limits, target)}
 

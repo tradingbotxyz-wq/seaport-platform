@@ -11,9 +11,10 @@
     "start": "node --disable-warning=ExperimentalWarning src/server.ts",
     "seed": "node --disable-warning=ExperimentalWarning src/seed.ts",
     "reset": "node --disable-warning=ExperimentalWarning src/seed.ts --reset",
-    "test": "node --disable-warning=ExperimentalWarning --test --test-reporter=spec test/api.test.ts",
+    "test": "node --disable-warning=ExperimentalWarning --test --test-reporter=spec --test-concurrency=1 test/api.test.ts test/security.test.ts",
     "test:engine": "python -m unittest discover -s engine/tests -v",
     "build:web": "node web/build.mjs",
-    "dev:web": "node web/build.mjs --watch"
+    "dev:web": "node web/build.mjs --watch",
+    "admin": "node --disable-warning=ExperimentalWarning src/admin.ts"
   }
 }

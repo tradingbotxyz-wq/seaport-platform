@@ -84,20 +84,34 @@ Open **http://localhost:3000**. The first start creates `data\seaport.db` and lo
 ### 2.4 Check it works (optional)
 
 ```powershell
-npm.cmd test              # 15 end-to-end API tests (starts its own engine and in-memory database)
-npm.cmd run test:engine   # Python engine unit tests
+npm.cmd test              # 34 end-to-end API and security tests (own engine, in-memory database)
+npm.cmd run test:engine   # 51 Python engine unit tests
 ```
 
 ### 2.5 Sign in
 
-Pick a demo user on the sign-in screen. For example:
+Sign in with a **username and password**. On a laptop, the demo users share the demo password, which is printed when the server starts:
 
-* **Priya Nair** (operations checker) approves funding.
-* **Rabuan** (operations maker) uploads files.
-* **Lucas Moreau** (trader) uses Brokerage.
-* **Pemberton** (investor) sees the investor portal only.
+```
+Seaport#Demo2026
+```
+
+Some demo users:
+
+* `priya` (operations checker) approves funding.
+* `rabuan` (operations maker) uploads files.
+* `sara` and `daniel` (credit) request and approve limit changes.
+* `meera` and `tom` (treasury) handle cash and payments.
+* `lucas` (trader) uses Brokerage.
+* `kenji` (compliance) approves bank details, brokers and access changes.
+* `pemberton` (investor) sees the investor portal only.
 
 The full list is in the README.
+
+* **Two-step verification (MFA)** is optional on a laptop: turn it on under *Profile → Sign-in security*. On a server (`NODE_ENV=production`) every user must set it up at first sign-in.
+* **Data is changed in two steps.** Changes to programs, obligors, limits, pricing, FX rates, fixings, bank details and user access take effect only after a **second person** approves them on the **Approvals** page. Example: `daniel` requests a limit, `sara` approves it.
+
+*Developers only:* `AUTH_MODE=demo` brings back the one-click user picker. It is refused when `NODE_ENV=production`, and must never be exposed to a network.
 
 ---
 
@@ -131,6 +145,7 @@ Run these from the project folder. On Windows, use `npm.cmd`.
 | `npm test` | End-to-end API tests |
 | `npm run test:engine` | Python unit tests |
 | `npm run build:web` | Rebuild the screens after editing `web/src` (needs the one-time step in §6) |
+| `npm run admin -- reset-password <user>` | Issue a one-time password (also `create-user`, `reset-mfa`, `unlock`, `list-users`) |
 | `git pull` | Get the latest code (stop the app first; database upgrades run automatically on the next start) |
 
 **Back up your local data:** stop the app, then copy the `data` folder somewhere safe.
@@ -142,6 +157,15 @@ Run these from the project folder. On Windows, use `npm.cmd`.
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `3000` | Web/API port |
+| `NODE_ENV` | (none) | `production` turns on the strict defaults: MFA required, Secure cookies, trusted proxy headers, no demo data |
+| `APP_SECRET` | key file `data/app.key` | 32-byte key (64 hex characters) that encrypts MFA secrets and signs the audit chain. **Keep it in AWS Secrets Manager; losing it means users must re-enrol MFA** |
+| `AUTH_MODE` | `password` | `demo` = user picker for development only (refused in production) |
+| `MFA_REQUIRED` | `true` in production | Every user must set up an authenticator app |
+| `COOKIE_SECURE` | `true` in production | Session cookie only over HTTPS |
+| `TRUST_PROXY` | `true` in production | Read the client IP and protocol from nginx / the load balancer |
+| `SESSION_IDLE_MINUTES` / `SESSION_MAX_HOURS` | `30` / `12` | Sign-out after inactivity / absolute session length |
+| `SEED_DEMO` | `false` in production | Load demo data into an empty production database (UAT only) |
+| `FIXING_MAX_AGE_DAYS` | `10` in production, `45` otherwise | Pricing refuses benchmark fixings older than this |
 | `HOST` | `127.0.0.1` | Network interface. Use `0.0.0.0` only inside Docker or behind a proxy |
 | `ENGINE_PORT` | `8001` | Port of the Python engine (local only) |
 | `ENGINE_URL` | (none) | Use an engine that is already running instead of starting one |
@@ -193,6 +217,10 @@ Run `npm test` before pushing.
 | `node:sqlite` or `.ts` errors at start | Node is older than 22.18. Upgrade Node |
 | Screens look old after `git pull` | Hard-refresh the browser (Ctrl+F5) |
 | Want a clean start | Stop the app, then run `npm.cmd run reset` (this deletes your local data) |
+| "Incorrect username or password" for a demo user | The demo password is `Seaport#Demo2026`. After 5 wrong attempts the account locks for 15 minutes: `npm.cmd run admin -- unlock <user>` |
+| Lost the phone with the authenticator app | Use one of the recovery codes, or ask an administrator to *Reset MFA* (User Access), or run `npm.cmd run admin -- reset-mfa <user>` |
+| A change "was submitted for approval" and nothing changed | Correct: a second authorised user must approve it on the **Approvals** page |
+| "No SOFR fixing within 45 days" when pricing | Add a current benchmark fixing in *Master Table → Fixings* (and approve it) |
 
 ---
 
@@ -203,9 +231,9 @@ This is the right fit for a pilot, UAT or internal demo.
 For multi-server, high-availability production, see §10.
 
 ```
-Users ──HTTPS──► nginx (EC2, port 443/80, password gate) ──► Node app :3000 ──► Python engine :8001
-                                   │                                 └── /var/lib/seaport (EBS): seaport.db + files
-                                   └── nightly backup ──► S3
+Users ──HTTPS──► nginx (EC2, 443; rate limits) ──► Node app :3000 (127.0.0.1) ──► Python engine :8001 (127.0.0.1, shared token)
+                                                         └── /var/lib/seaport (encrypted EBS): seaport.db + files
+                         nightly backup (/var/backups/seaport, root-only) ──► S3 (KMS)
 ```
 
 ### 8.1 Create the server (AWS console)
@@ -248,12 +276,25 @@ The script:
 * creates the `seaport` service user and `/var/lib/seaport` (database + documents);
 * copies the app to `/opt/seaport-platform`;
 * installs the **systemd** service (auto-start on boot, restart on failure);
-* configures **nginx** with a password gate. It asks you to set the password for user `seaport`.
+* creates **`/etc/seaport/seaport.env`** (root-only) with a random `APP_SECRET`. **Copy this value into AWS Secrets Manager**: backups cannot be fully restored without it;
+* configures **nginx** with rate limits on sign-in and the API.
 
-Open `http://<elastic-ip>/`, enter the gate password, and pick a user. The first start loads demo data.
-To start with an empty system instead, run `sudo systemctl stop seaport`, then load your own users and programs (see §11).
+The service runs with `NODE_ENV=production`: MFA is required, cookies are HTTPS-only, and the database starts **empty** (no demo data).
 
-### 8.4 HTTPS
+1. **Turn on HTTPS first** (§8.4). Sign-in does not work over plain HTTP in production.
+2. **Create the first administrator:**
+
+   ```bash
+   sudo bash deploy/aws-ec2/admin.sh create-user jsmith ADMIN "Jane Smith" jane.smith@seaportglobal.com
+   ```
+
+   This prints a one-time password.
+3. Open `https://seaport.yourcompany.com/`, sign in, set up the authenticator app, save the recovery codes and choose a password.
+4. Under *User Access*, request the other users. A **second** administrator or the Compliance user approves each request. Then use *Reset password* to give each user a one-time password through a separate channel, such as a phone call.
+
+*For a UAT server with demo data:* add `SEED_DEMO=true` to `/etc/seaport/seaport.env` before the first start. The demo users then get **random one-time passwords**, printed once in `journalctl -u seaport`.
+
+### 8.4 HTTPS (required)
 
 With a domain pointing at the server:
 
@@ -262,7 +303,9 @@ sudo apt-get install -y certbot python3-certbot-nginx
 sudo certbot --nginx -d seaport.yourcompany.com     # auto-renews
 ```
 
-*Alternative:* put an **Application Load Balancer** in front, with an **ACM** certificate, health check path `/api/health`, and the EC2 security group allowing port 80 only from the ALB.
+certbot also redirects HTTP to HTTPS. The app sends `Strict-Transport-Security` once cookies are Secure.
+
+*Alternative:* put an **Application Load Balancer** in front, with an **ACM** certificate (HTTPS listener plus an HTTP→HTTPS redirect) and health check path `/api/health`. Allow port 80 on the EC2 security group only from the ALB. Add **AWS WAF** with the managed rule groups for common threats and IP reputation.
 
 ### 8.5 Deploy new versions
 
@@ -284,16 +327,16 @@ sudo BACKUP_BUCKET=seaport-backups-<account-id> bash ~/seaport-platform/deploy/a
 30 1 * * * BACKUP_BUCKET=seaport-backups-<account-id> bash /home/ubuntu/seaport-platform/deploy/aws-ec2/backup.sh >> /var/log/seaport-backup.log 2>&1
 ```
 
-The backup uses SQLite's online-backup API, so it is safe while the app runs. It checks integrity, keeps 14 local copies and copies them to S3.
+The backup uses SQLite's online-backup API, so it is safe while the app runs. It checks integrity and keeps 14 local copies in root-owned `/var/backups/seaport`, so the app user cannot delete them. It then copies them to S3 with KMS encryption. For immutable backups, enable **S3 Object Lock** on the bucket. Keep `APP_SECRET` (Secrets Manager) alongside them.
 Also enable **AWS Backup** or daily **EBS snapshots** of the volume.
 
 **Restore:**
 
 ```bash
 sudo systemctl stop seaport
-sudo cp <backup>/seaport.db /var/lib/seaport/seaport.db
+sudo cp /var/backups/seaport/<stamp>/seaport.db /var/lib/seaport/seaport.db
 sudo rm -f /var/lib/seaport/seaport.db-wal /var/lib/seaport/seaport.db-shm
-sudo tar -xzf <backup>/files.tar.gz -C /var/lib/seaport
+sudo tar -xzf /var/backups/seaport/<stamp>/files.tar.gz -C /var/lib/seaport
 sudo chown -R seaport:seaport /var/lib/seaport
 sudo systemctl start seaport
 ```
@@ -306,7 +349,8 @@ sudo systemctl start seaport
 | Logs (live) | `sudo journalctl -u seaport -f` |
 | Restart | `sudo systemctl restart seaport` |
 | Health | `curl http://127.0.0.1:3000/api/health` |
-| Change gate password | `sudo htpasswd /etc/nginx/seaport.htpasswd seaport` |
+| Reset a user's password / MFA, unlock | `sudo bash deploy/aws-ec2/admin.sh reset-password <user>` (or `reset-mfa`, `unlock`); also on the *User Access* screen |
+| Who signed in, who approved what | *Reports → Regulatory → Audit trail*, or the `audit_log` table |
 
 Optional: install the CloudWatch agent to ship `journalctl` logs, and add a CloudWatch alarm on instance status checks.
 
@@ -320,10 +364,10 @@ A `Dockerfile` is included. It packages Node, Python and the app in one image. D
 docker build -t seaport-platform .
 docker run -d --name seaport --restart unless-stopped \
   -p 127.0.0.1:3000:3000 -v seaport-data:/data \
-  -e TZ=America/New_York seaport-platform
+  --env-file /etc/seaport/seaport.env -e TZ=America/New_York seaport-platform
 ```
 
-On EC2, install Docker (`sudo apt-get install -y docker.io`), run the commands above, and keep nginx (§8.3–8.4) in front for HTTPS and the password gate.
+On EC2, install Docker (`sudo apt-get install -y docker.io`), create `/etc/seaport/seaport.env` with `APP_SECRET=<openssl rand -hex 32>` (mode 600), run the commands above, and keep nginx (§8.3–8.4) in front for HTTPS. Always publish the port on `127.0.0.1`: Docker's own port publishing bypasses host firewalls. Create the first administrator with `docker exec -it seaport node --disable-warning=ExperimentalWarning src/admin.ts create-user ...`.
 To use **Amazon ECR**:
 
 1. Create a repository.
@@ -343,9 +387,9 @@ This is the architecture in the proposal. Moving to it is planned under *Module 
 | Compute | 1 × EC2 (systemd) | **ECS Fargate**: API service (2+ tasks, multi-AZ) and Python engine service, behind an **ALB** with **AWS WAF** |
 | Database | SQLite on EBS | **Aurora PostgreSQL** (Multi-AZ, encrypted, PITR backups). Only `src/lib/db.ts` and the SQL dialect change |
 | Documents | `/var/lib/seaport/files` | **S3** (SSE-KMS, versioning, Object Lock for audit evidence) |
-| Sign-in | Demo user picker + nginx password | **Amazon Cognito** or **Entra ID SSO**, with MFA. Roles map to the existing permission model |
+| Sign-in | Passwords (scrypt) + TOTP MFA, server-side sessions, lockout | Optionally federate to **Amazon Cognito** or **Entra ID SSO**. Roles map to the existing permission model |
+| Secrets | `APP_SECRET` in a root-only env file | **Secrets Manager**, injected into the task |
 | Notifications | In-app outbox | **SES** e-mail / **SNS**, with **EventBridge** for integration events |
-| Secrets | Environment variables | **Secrets Manager** / SSM Parameter Store |
 | Monitoring | journald | **CloudWatch** logs, metrics and alarms; **CloudTrail**; **GuardDuty** |
 | Delivery | `update.sh` | **GitHub Actions** → test → build image → **ECR** → ECS rolling deploy; **Terraform** for all infrastructure |
 | Network | Public EC2 + security group | **VPC** with private subnets for app/DB, NAT, VPC endpoints for S3/ECR |
@@ -354,13 +398,24 @@ This is the architecture in the proposal. Moving to it is planned under *Module 
 
 ## 11. Security checklist before real users or client data
 
-The current build is an MVP for demonstration and UAT. **Before any real client data:**
+These items are already built in. The full list, and the results of the external reviews, are in [`docs/SECURITY.md`](SECURITY.md):
 
-- [ ] **Real sign-in.** The user picker trusts the browser (`X-User` header), so anyone who reaches the app can act as any user. Until Module 7 (password + MFA / SSO) is deployed, keep the nginx password gate on **and** limit the security group to known IPs or VPN.
-- [ ] HTTPS only (certbot or ALB + ACM).
-- [ ] Remove the demo data: start from an empty database and create the real users, programs and obligors.
-- [ ] Encrypted EBS volume and S3 backup bucket (both are on if you followed §8.1).
-- [ ] Nightly backups verified with a test restore.
-- [ ] OS patching: `sudo apt-get update && sudo apt-get upgrade` monthly, or enable `unattended-upgrades`.
-- [ ] Replace the mock KYC/AML, credit bureau and market-data adapters (`src/integrations/screening.ts`, `engine/brokerage.py`) with the real providers.
-- [ ] Penetration test and UAT sign-off.
+* passwords with MFA
+* sessions with idle timeout
+* lockout and CSRF protection
+* four-eyes approval of reference data, bank details and access
+* masked bank details
+* append-only ledger with a keyed audit chain
+* hardened service and proxy
+
+**Before go-live:**
+
+- [ ] HTTPS only (certbot or ALB + ACM); security groups limited to the load balancer / office / VPN ranges.
+- [ ] `APP_SECRET` stored in AWS Secrets Manager; backups and the secret tested by an actual restore.
+- [ ] Production started with an empty database (no `SEED_DEMO`); real users created through the admin CLI and the approval workflow.
+- [ ] At least **two** administrators and one Compliance user, so access changes can always be approved by someone else.
+- [ ] Every user has set up MFA (*User Access* shows "MFA on"); recovery codes stored by each user.
+- [ ] Mock adapters replaced with real providers: KYC/AML and credit bureau (`src/integrations/screening.ts`), market data (`engine/brokerage.py`), current benchmark fixings and FX feeds.
+- [ ] OS patching: `unattended-upgrades` (installed) plus a monthly review.
+- [ ] CloudWatch alarms on the instance, plus log shipping for `journalctl -u seaport`.
+- [ ] Independent penetration test and UAT sign-off.

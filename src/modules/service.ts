@@ -2,6 +2,7 @@
 // per-loan sub-ledger and restructuring / workout analysis.
 
 import type { Services, User } from '../core/context.ts';
+import { assertNotRecentlyReset } from '../core/cooldown.ts';
 import { requirePermission, can, now, nextRef, daysBetween, addDays } from '../core/context.ts';
 import * as audit from '../core/audit.ts';
 import { emit } from '../core/outbox.ts';
@@ -10,7 +11,7 @@ import { badRequest, conflict, forbidden, notFound, validation } from '../lib/er
 import * as ledger from './ledger.ts';
 import { createDistributionInternal } from './fund.ts';
 
-export const SYSTEM: User = { username: 'system', name: 'System', role: 'ADMIN' };
+export const SYSTEM: User = { username: 'system', name: 'System', role: 'SYSTEM' };
 const SLA_HOURS: Record<string, number> = { URGENT: 4, HIGH: 24, MEDIUM: 72, LOW: 120 };
 export const CASE_TYPES = ['DELINQUENCY', 'MATURITY_EXTENSION', 'PAYMENT_QUERY', 'DISPUTE', 'DILUTION', 'INVESTOR_REQUEST', 'TRANSFER', 'REDEMPTION', 'RESTRUCTURE', 'KYC_REFRESH', 'GENERAL'];
 const BUCKETS: [number, string][] = [[0, 'Current'], [30, '1–30 days'], [60, '31–60 days'], [90, '61–90 days'], [Infinity, '90+ days']];
@@ -74,20 +75,27 @@ export async function postLateFees(svc: Services, user: User) {
   const due = d.loans.filter((l) => l.late_fee_accrued_cents > l.late_fee_posted_cents);
   if (!due.length) return { posted: 0, total_by_currency: {} };
   const totals: Record<string, number> = {};
+  const posted: string[] = [];
   svc.db.tx(() => {
     for (const l of due) {
-      const amount = l.late_fee_accrued_cents - l.late_fee_posted_cents;
-      const loan = svc.db.get('SELECT program_id FROM loans WHERE id = ?', [l.id]);
+      // Re-read inside the transaction: a concurrent run may already have posted these fees.
+      const loan = svc.db.get<any>("SELECT program_id, late_fees_posted_cents FROM loans WHERE id = ? AND status = 'OPEN'", [l.id]);
+      if (!loan) continue;
+      const amount = l.late_fee_accrued_cents - loan.late_fees_posted_cents;
+      if (amount <= 0) continue;
+      const moved = svc.db.run('UPDATE loans SET late_fees_posted_cents = ?, fees_cents = fees_cents + ? WHERE id = ? AND late_fees_posted_cents = ?',
+        [l.late_fee_accrued_cents, amount, l.id, loan.late_fees_posted_cents]).changes;
+      if (moved !== 1) continue;
       ledger.post(svc.db, user, {
         date: svc.today(), description: `Late payment charge ${l.loan_ref} (${l.days_past_due} days past due)`, source_type: 'LATE_FEE', source_id: l.id, currency: l.currency,
         lines: [{ account: '1300', debit: amount, program_id: loan.program_id, loan_id: l.id }, { account: '4100', credit: amount, program_id: loan.program_id, loan_id: l.id }],
       });
-      svc.db.run('UPDATE loans SET late_fees_posted_cents = ?, fees_cents = fees_cents + ? WHERE id = ?', [l.late_fee_accrued_cents, amount, l.id]);
       totals[l.currency] = (totals[l.currency] ?? 0) + amount;
+      posted.push(l.loan_ref);
     }
-    audit.record(svc.db, user, 'late_fees.posted', 'loan', null, { loans: due.map((l) => l.loan_ref), totals });
+    if (posted.length) audit.record(svc.db, user, 'late_fees.posted', 'loan', null, { loans: posted, totals });
   });
-  return { posted: due.length, total_by_currency: totals };
+  return { posted: posted.length, total_by_currency: totals };
 }
 
 // ---------- Cases ----------
@@ -128,8 +136,8 @@ export function listCases(svc: Services, user: User, query: URLSearchParams) {
     .map((c) => ({ ...c, sla_breached: !['RESOLVED', 'REJECTED'].includes(c.status) && c.sla_due_at < nowIso }));
 }
 
-export function createCase(svc: Services, user: User, body: unknown) {
-  requirePermission(user, 'service.cases');
+export function createCase(svc: Services, user: User, body: unknown, viaPortal = false) {
+  if (!viaPortal) requirePermission(user, 'service.cases');
   const input = check<any>(body, {
     case_type: { type: 'enum', required: true, values: CASE_TYPES },
     priority: { type: 'enum', required: true, values: ['LOW', 'MEDIUM', 'HIGH', 'URGENT'] },
@@ -204,7 +212,35 @@ export function updateCase(svc: Services, user: User, id: number, body: any) {
 
 // ---------- Amendments ----------
 
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const isDate = (v: unknown) => typeof v === 'string' && ISO_DATE.test(v) && !Number.isNaN(Date.parse(v));
+const isInt = (v: unknown, lo: number, hi: number) => Number.isSafeInteger(v) && (v as number) >= lo && (v as number) <= hi;
+
+/** Payload checks per amendment type, before anything is stored. */
+function validatePayload(svc: Services, type: string, p: any) {
+  const e: Record<string, string> = {};
+  if (!p || typeof p !== 'object' || Array.isArray(p)) throw validation({ payload: 'must be an object' });
+  if (type === 'LOAN_EXTENSION') {
+    if (!isInt(p.loan_id, 1, Number.MAX_SAFE_INTEGER)) e.loan_id = 'required';
+    if (!isDate(p.new_maturity_date)) e.new_maturity_date = 'must be a date (YYYY-MM-DD)';
+  } else if (type === 'COMMITMENT_TRANSFER') {
+    if (!isInt(p.commitment_id, 1, Number.MAX_SAFE_INTEGER)) e.commitment_id = 'required';
+    if (!isInt(p.to_investor_id, 1, Number.MAX_SAFE_INTEGER)) e.to_investor_id = 'required';
+  } else if (type === 'REDEMPTION') {
+    if (!isInt(p.commitment_id, 1, Number.MAX_SAFE_INTEGER)) e.commitment_id = 'required';
+    if (p.payment_date !== undefined && (!isDate(p.payment_date) || p.payment_date < svc.today())) e.payment_date = 'must be today or later';
+  } else if (type === 'RESTRUCTURE') {
+    if (!isInt(p.loan_id, 1, Number.MAX_SAFE_INTEGER)) e.loan_id = 'required';
+    if (!isInt(p.periods, 1, 120)) e.periods = 'whole months, 1 to 120';
+    if (p.margin_bps !== undefined && !isInt(p.margin_bps, 0, 5000)) e.margin_bps = 'whole basis points, 0 to 5000';
+    if (p.rate_path !== undefined && (!Array.isArray(p.rate_path) || !p.rate_path.length || p.rate_path.length > 120
+      || p.rate_path.some((r: any) => !isInt(r?.from_period, 1, 120) || !isInt(r?.base_bps, -500, 5000)))) e.rate_path = 'list of {from_period 1-120, base_bps -500..5000}';
+  }
+  if (Object.keys(e).length) throw validation(e);
+}
+
 async function previewAmendment(svc: Services, type: string, p: any) {
+  validatePayload(svc, type, p);
   if (type === 'LOAN_EXTENSION') {
     const l = svc.db.get(`SELECT l.*, i.all_in_bps, pr.day_count FROM loans l JOIN invoices i ON i.id = l.invoice_id JOIN programs pr ON pr.id = l.program_id WHERE l.id = ?`, [p.loan_id]);
     if (!l) throw badRequest('Unknown loan');
@@ -224,8 +260,14 @@ async function previewAmendment(svc: Services, type: string, p: any) {
     if (!to) throw badRequest('Unknown receiving investor');
     if (to.id === c.investor_id) throw validation({ to_investor_id: 'must be a different investor' });
     if (svc.db.get('SELECT id FROM commitments WHERE investor_id = ? AND pool_id = ? AND tranche = ?', [to.id, c.pool_id, c.tranche])) throw conflict(`${to.code} already holds a commitment in this tranche`);
+    const pending = svc.db.get(`SELECT 1 FROM capital_call_lines l JOIN capital_calls cc ON cc.id = l.call_id WHERE l.commitment_id = ? AND cc.status = 'DRAFT'
+      UNION ALL SELECT 1 FROM distribution_lines dl JOIN distributions d ON d.id = dl.distribution_id WHERE dl.commitment_id = ? AND (d.status = 'DRAFT' OR (d.status = 'APPROVED'))`, [c.id, c.id]);
+    if (pending) throw conflict('Settle or cancel the draft capital calls and unpaid distributions on this commitment before transferring it');
+    // Investor capital (3000) carried by this commitment = called (issued) less capital returned; receivable (1100) = called less received.
+    const called = svc.db.get<{ s: number }>("SELECT COALESCE(SUM(l.amount_cents),0) s FROM capital_call_lines l JOIN capital_calls cc ON cc.id = l.call_id WHERE l.commitment_id = ? AND cc.status IN ('ISSUED','SETTLED')", [c.id])!.s;
     const paid = svc.db.get<{ s: number }>('SELECT COALESCE(SUM(received_cents),0) s FROM capital_call_lines WHERE commitment_id = ?', [c.id])!.s;
-    return { from: c.code, to: to.code, commitment_cents: c.amount_cents, paid_in_cents: paid, currency: c.currency, tranche: c.tranche };
+    const returned = svc.db.get<{ s: number }>("SELECT COALESCE(SUM(dl.amount_cents),0) s FROM distribution_lines dl JOIN distributions d ON d.id = dl.distribution_id WHERE dl.commitment_id = ? AND d.kind = 'CAPITAL' AND d.status IN ('APPROVED','PAID')", [c.id])!.s;
+    return { from: c.code, to: to.code, commitment_cents: c.amount_cents, paid_in_cents: paid, capital_cents: called - returned, receivable_cents: called - paid, currency: c.currency, tranche: c.tranche };
   }
   if (type === 'REDEMPTION') {
     const c = svc.db.get('SELECT c.*, i.code FROM commitments c JOIN investors i ON i.id = c.investor_id WHERE c.id = ?', [p.commitment_id]);
@@ -268,6 +310,7 @@ export async function proposeAmendment(svc: Services, user: User, caseId: number
 
 export async function decideAmendment(svc: Services, user: User, id: number, body: any) {
   requirePermission(user, 'service.approve');
+  assertNotRecentlyReset(svc, user);
   const a = svc.db.get('SELECT * FROM amendments WHERE id = ?', [id]);
   if (!a) throw notFound('Amendment');
   if (a.status !== 'PROPOSED') throw conflict(`Amendment is ${a.status}`);
@@ -279,9 +322,13 @@ export async function decideAmendment(svc: Services, user: User, id: number, bod
   const payload = JSON.parse(a.payload);
   const preview = decision === 'APPLY' ? await previewAmendment(svc, a.amendment_type, payload) : null; // re-validate against current state
   return svc.db.tx(() => {
+    // Claim the decision first: a concurrent APPLY and REJECT cannot both succeed.
+    const claimed = svc.db.run("UPDATE amendments SET status = ?, decided_by = ?, decided_at = ? WHERE id = ? AND status = 'PROPOSED'",
+      [decision === 'APPLY' ? 'APPLIED' : 'REJECTED', user.username, now(), id]).changes;
+    if (claimed !== 1) throw conflict('Amendment was already decided');
     let result: any = null;
     if (decision === 'APPLY') result = apply(svc, user, a.amendment_type, payload, preview);
-    svc.db.run('UPDATE amendments SET status = ?, decided_by = ?, decided_at = ?, result = ? WHERE id = ?', [decision === 'APPLY' ? 'APPLIED' : 'REJECTED', user.username, now(), JSON.stringify(result ?? { note }), id]);
+    svc.db.run('UPDATE amendments SET result = ? WHERE id = ?', [JSON.stringify(result ?? { note }), id]);
     svc.db.run("UPDATE cases SET status = 'IN_PROGRESS' WHERE id = ?", [a.case_id]);
     event(svc, a.case_id, 'AMENDMENT', decision === 'APPLY' ? `Approved and applied by ${user.name}${note ? `: ${note}` : ''}` : `Rejected by ${user.name}: ${note}`, user);
     audit.record(svc.db, user, decision === 'APPLY' ? 'amendment.applied' : 'amendment.rejected', 'case', a.case_id, { amendment_id: id, type: a.amendment_type, result, note });
@@ -307,10 +354,12 @@ function apply(svc: Services, user: User, type: string, p: any, preview: any) {
     svc.db.run('UPDATE commitments SET investor_id = ? WHERE id = ?', [p.to_investor_id, c.id]);
     svc.db.run('UPDATE capital_call_lines SET investor_id = ? WHERE commitment_id = ?', [p.to_investor_id, c.id]);
     let je = null;
-    if (preview.paid_in_cents > 0) {
+    const lines: any[] = [];
+    if (preview.capital_cents > 0) lines.push({ account: '3000', debit: preview.capital_cents, investor_id: c.investor_id }, { account: '3000', credit: preview.capital_cents, investor_id: p.to_investor_id });
+    if (preview.receivable_cents > 0) lines.push({ account: '1100', debit: preview.receivable_cents, investor_id: p.to_investor_id }, { account: '1100', credit: preview.receivable_cents, investor_id: c.investor_id });
+    if (lines.length) {
       je = ledger.post(svc.db, user, {
-        date: svc.today(), description: `Transfer of ${preview.tranche} commitment ${preview.from} → ${preview.to}`, source_type: 'COMMITMENT_TRANSFER', source_id: c.id, currency: c.currency,
-        lines: [{ account: '3000', debit: preview.paid_in_cents, investor_id: c.investor_id }, { account: '3000', credit: preview.paid_in_cents, investor_id: p.to_investor_id }],
+        date: svc.today(), description: `Transfer of ${preview.tranche} commitment ${preview.from} → ${preview.to}`, source_type: 'COMMITMENT_TRANSFER', source_id: c.id, currency: c.currency, lines,
       });
     }
     return { commitment_id: c.id, from: preview.from, to: preview.to, journal_entry_id: je };

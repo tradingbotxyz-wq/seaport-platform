@@ -191,16 +191,31 @@ def _table(doc: _Doc, t: dict):
             header()
         x = MARGIN
         for i in range(n):
-            cell = r[i] if i < len(r) else ""
-            maxw = widths[i] - 10
-            while cell and text_width(cell, size, bold) > maxw:
-                cell = cell[:-2] + "\x85"
+            cell = _fit(str(r[i] if i < len(r) else "")[:MAX_CELL], max(widths[i] - 10, 0), size, bold)
             tx = x + 5 if align[i] == "l" else x + widths[i] - 5 - text_width(cell, size, bold)
             doc.text(tx, doc.y - 11, cell, size, bold)
             x += widths[i]
         doc.y -= 15
         doc.rule(doc.y)
     doc.y -= 6
+
+
+MAX_CELL = 300
+
+
+def _fit(cell: str, maxw: float, size: float, bold: bool) -> str:
+    """Truncate with an ellipsis so the text fits maxw. Bounded: at most len(cell) iterations."""
+    if text_width(cell, size, bold) <= maxw:
+        return cell
+    ell = "\x85"
+    lo, hi = 0, len(cell)
+    while lo < hi:  # binary search for the longest prefix that fits with the ellipsis
+        mid = (lo + hi + 1) // 2
+        if text_width(cell[:mid] + ell, size, bold) <= maxw:
+            lo = mid
+        else:
+            hi = mid - 1
+    return cell[:lo] + ell if lo > 0 else ""
 
 
 def _serialize(doc: _Doc) -> bytes:

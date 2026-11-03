@@ -820,6 +820,78 @@ CREATE TRIGGER collection_no_update BEFORE UPDATE ON collection_actions BEGIN SE
 CREATE TRIGGER collection_no_delete BEFORE DELETE ON collection_actions BEGIN SELECT RAISE(ABORT, 'collection history is append-only'); END;
 `,
   },
+  {
+    id: 9,
+    name: 'authentication, sessions, approvals and control hardening',
+    sql: `
+-- Sign-in: passwords (scrypt), TOTP MFA, lockout, forced password change.
+ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN mfa_last_step INTEGER;
+ALTER TABLE users ADD COLUMN password_changed_at TEXT;
+ALTER TABLE users ADD COLUMN mfa_failed INTEGER NOT NULL DEFAULT 0;
+-- After an administrator resets someone's credentials, that account cannot approve anything for a cooling-off period.
+ALTER TABLE users ADD COLUMN credentials_reset_at TEXT;
+
+-- Server-side sessions. Only a SHA-256 of the session token is stored.
+CREATE TABLE sessions (
+  id_hash TEXT PRIMARY KEY,
+  username TEXT NOT NULL REFERENCES users(username),
+  mfa_passed INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  ip TEXT,
+  user_agent TEXT,
+  revoked_at TEXT,
+  revoked_reason TEXT
+);
+CREATE INDEX idx_sessions_user ON sessions(username, revoked_at);
+
+CREATE TABLE mfa_recovery_codes (
+  username TEXT NOT NULL REFERENCES users(username),
+  code_hash TEXT NOT NULL,
+  used_at TEXT,
+  PRIMARY KEY (username, code_hash)
+);
+
+-- Audit chain v2: keyed (HMAC) hash that also covers the role. The anchor (keyed) records the last
+-- legacy row: every later row must be keyed, so the chain cannot be downgraded without the key.
+ALTER TABLE audit_log ADD COLUMN hash_alg TEXT NOT NULL DEFAULT 'sha256';
+CREATE TABLE audit_anchor (id INTEGER PRIMARY KEY CHECK (id = 1), legacy_until INTEGER NOT NULL, mac TEXT NOT NULL);
+
+-- Maker-checker for master data, FX, fixings, bank accounts and user access.
+CREATE TABLE change_requests (
+  id INTEGER PRIMARY KEY,
+  ref TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT,
+  summary TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  before TEXT,
+  reason TEXT,
+  requires_role TEXT,
+  status TEXT NOT NULL CHECK (status IN ('PENDING','APPLIED','REJECTED','CANCELLED')),
+  requested_by TEXT NOT NULL,
+  requested_at TEXT NOT NULL,
+  decided_by TEXT,
+  decided_at TEXT,
+  decision_note TEXT
+);
+CREATE INDEX idx_change_requests ON change_requests(status, kind);
+
+-- Funding: everyone who changed a file's content after upload, and a version for race detection.
+ALTER TABLE invoice_imports ADD COLUMN modified_by TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE invoice_imports ADD COLUMN version INTEGER NOT NULL DEFAULT 0;
+-- Underwriting: everyone who edited or submitted an application.
+ALTER TABLE credit_applications ADD COLUMN editors TEXT NOT NULL DEFAULT '[]';
+-- Reconciliation: who matched a line by hand.
+ALTER TABLE bank_lines ADD COLUMN matched_by TEXT;
+-- Fees (late / extension) collected in cash, so account 1300 is cleared when paid.
+ALTER TABLE loans ADD COLUMN fees_paid_cents INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX idx_bank_lines_ref ON bank_lines(bank_reference);
+`,
+  },
 ];
 
 export function migrate(db: Db): void {

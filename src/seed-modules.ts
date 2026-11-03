@@ -9,6 +9,7 @@ import * as fund from './modules/fund.ts';
 import * as ledger from './modules/ledger.ts';
 import * as service from './modules/service.ts';
 import * as brokerage from './modules/brokerage.ts';
+import * as approvals from './modules/approvals.ts';
 import { seedFundedBatch } from './seed.ts';
 import { obligorUsage } from './modules/exposure.ts';
 import { addMonths, monthOf } from './modules/dashboard.ts';
@@ -29,6 +30,9 @@ const EXTRA_USERS: [string, string, string, string][] = [
   ['kenji', 'Kenji Watanabe', 'kenji.watanabe@seaportglobal.example', 'COMPLIANCE'],
   ['lucas', 'Lucas Moreau', 'lucas.moreau@seaportglobal.example', 'TRADER'],
 ];
+
+/** The built-in demo accounts (base seed + modules + investor). */
+export const DEMO_USERNAMES = ['admin', 'rabuan', 'priya', 'daniel', 'meera', 'tom', 'audit', ...EXTRA_USERS.map((u) => u[0]), 'pemberton'];
 
 function user(svc: Services, username: string): User {
   const u = svc.db.get<User>('SELECT username, name, role FROM users WHERE username = ?', [username]);
@@ -133,7 +137,7 @@ async function seedPools(svc: Services) {
     name: 'SCF Receivables Pool 2026-A', currency: 'USD', target_size_cents: M(90),
     strategy: 'Short-dated USD supply-chain and receivables-purchase assets; senior notes placed with institutional investors.',
     criteria: { programs: [], min_rating: 'B+', min_remaining_days: 5, max_remaining_days: 180 },
-    limits: { max_obligor_bps: 2000, max_program_bps: 5000, max_country_bps: 9000, max_sub_ig_bps: 5500 },
+    limits: { max_obligor_bps: 2500, max_program_bps: 6000, max_sub_ig_bps: 6000 },
     tranches: [{ name: 'SENIOR', pct_bps: 8000, coupon_bps: 520 }, { name: 'MEZZANINE', pct_bps: 1200, coupon_bps: 780 }, { name: 'EQUITY', pct_bps: 800, coupon_bps: 0 }],
   }) as any).json.id;
   await pools.autoBuild(svc, olivia, a, true);
@@ -143,7 +147,7 @@ async function seedPools(svc: Services) {
     name: 'UK Insured Receivables Pool 2026-1', currency: 'GBP', target_size_cents: M(20),
     strategy: 'Credit-insured UK healthcare receivables.',
     criteria: { programs: ['PRG-1088'], min_rating: 'BB+', min_remaining_days: 10 },
-    limits: { max_obligor_bps: 6000, max_sub_ig_bps: 7000 },
+    limits: { max_obligor_bps: 8000, max_sub_ig_bps: 8000 },
     tranches: [{ name: 'SENIOR', pct_bps: 8500, coupon_bps: 480 }, { name: 'EQUITY', pct_bps: 1500, coupon_bps: 0 }],
   }) as any).json.id;
   await pools.autoBuild(svc, olivia, b, true);
@@ -158,7 +162,11 @@ async function seedFund(svc: Services) {
   if (!svc.db.get("SELECT id FROM investors WHERE code = 'INV-0004'")) svc.db.run("INSERT INTO investors (code, name) VALUES ('INV-0004', 'Seaport Global (risk retention)')");
   const inv = (code: string) => svc.db.get<{ id: number }>('SELECT id FROM investors WHERE code = ?', [code])!.id;
   const prog = (code: string) => svc.db.get<{ id: number }>('SELECT id FROM programs WHERE program_code = ?', [code])?.id;
-  const acct = (b: any) => fund.saveBankAccount(svc, rabuan, null, b);
+  const kenji = user(svc, 'kenji');
+  const acct = (b: any) => {
+    const r = fund.saveBankAccount(svc, rabuan, null, b) as any;
+    approvals.decideChange(svc, kenji, r.json.change_request.id, { decision: 'APPROVE', note: 'Verified by call-back to the account holder' });
+  };
   acct({ owner_type: 'SEAPORT', account_name: 'Seaport Global LLP - USD operating', bank_name: 'JPMorgan Chase Bank', routing_number: '021000021', account_number: '000123456789', currency: 'USD', country: 'US' });
   acct({ owner_type: 'SEAPORT', account_name: 'Seaport Global LLP - EUR operating', bank_name: 'Deutsche Bank AG', bic: 'DEUTDEFF', iban: 'DE89370400440532013000', currency: 'EUR', country: 'DE' });
   acct({ owner_type: 'SEAPORT', account_name: 'Seaport Global LLP - GBP operating', bank_name: 'Barclays Bank plc', bic: 'BARCGB22', iban: 'GB33BUKB20201555555555', currency: 'GBP', country: 'GB' });
@@ -205,9 +213,9 @@ async function seedFund(svc: Services) {
       }));
     }
     // Income distribution to senior noteholders: approved, payments queued for disbursement.
-    const dist = (fund.createDistribution(svc, olivia, { pool_id: pool.id, tranche: 'SENIOR', kind: 'INCOME', amount_cents: M(0.1125), payment_date: due }) as any).json;
+    const dist = (fund.createDistribution(svc, olivia, { pool_id: pool.id, tranche: 'SENIOR', kind: 'INCOME', amount_cents: M(0.05), payment_date: due }) as any).json;
     fund.approveDistribution(svc, tom, dist.id);
-    fund.createDistribution(svc, olivia, { pool_id: pool.id, tranche: 'EQUITY', kind: 'INCOME', amount_cents: M(0.04), payment_date: due });
+    fund.createDistribution(svc, olivia, { pool_id: pool.id, tranche: 'EQUITY', kind: 'INCOME', amount_cents: M(0.02), payment_date: due });
   }
 }
 

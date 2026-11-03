@@ -63,3 +63,15 @@ export function intParam(value: string | undefined, name = 'id'): number {
   if (!Number.isSafeInteger(n) || n <= 0) throw badRequest(`Invalid ${name}`);
   return n;
 }
+
+/** Keep an uploaded file's name to a safe, printable form: no paths, control characters or shell/CSV specials. */
+export function safeFilename(name: string): string {
+  const base = String(name).split(/[\\/]/).pop() ?? '';
+  const clean = base.normalize('NFKC').replace(/[^A-Za-z0-9._ ()-]/g, '_').replace(/_{2,}/g, '_').replace(/^[.\s_-]+/, '').slice(0, 120);
+  return clean || 'upload';
+}
+
+/** Spreadsheet formula injection: text starting with = + - @ or a control character is prefixed with an apostrophe. */
+export function safeCell(v: unknown): unknown {
+  return typeof v === 'string' && /^[=+\-@\t\r]/.test(v) ? `'${v}` : v;
+}

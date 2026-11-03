@@ -2,6 +2,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
 import { HttpError, unavailable } from '../lib/errors.ts';
 
 export interface EngineClient {
@@ -15,13 +16,13 @@ export interface EngineClient {
   health(): Promise<boolean>;
 }
 
-export function httpEngine(baseUrl: string, timeoutMs = 30_000): EngineClient {
+export function httpEngine(baseUrl: string, token: string, timeoutMs = 30_000): EngineClient {
   async function post(path: string, body: unknown) {
     let res: Response;
     try {
       res = await fetch(baseUrl + path, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Engine-Token': token },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -29,8 +30,11 @@ export function httpEngine(baseUrl: string, timeoutMs = 30_000): EngineClient {
       throw unavailable('Analytics engine (Python) is not reachable. Is it running?');
     }
     const data = await res.json().catch(() => ({}));
-    if (res.status === 422) throw new HttpError(422, 'engine_validation_error', data.message ?? 'Engine rejected the input');
-    if (!res.ok) throw unavailable(`Analytics engine error: ${data.message ?? res.status}`);
+    if (res.status === 422) throw new HttpError(422, 'engine_validation_error', String(data.message ?? 'Engine rejected the input').slice(0, 500));
+    if (!res.ok) {
+      console.error(`[engine] ${path} -> ${res.status} ${data.error ?? ''}`);
+      throw unavailable('The analytics engine could not complete this request');
+    }
     return data;
   }
   return {
@@ -43,8 +47,8 @@ export function httpEngine(baseUrl: string, timeoutMs = 30_000): EngineClient {
     call: (path, body) => post(path, body),
     async health() {
       try {
-        const r = await fetch(baseUrl + '/health', { signal: AbortSignal.timeout(1000) });
-        return r.ok;
+        const r = await fetch(baseUrl + '/health', { headers: { 'X-Engine-Token': token }, signal: AbortSignal.timeout(1000) });
+        return r.ok && (await r.json()).authenticated === true;
       } catch {
         return false;
       }
@@ -58,18 +62,18 @@ function pythonCandidates(): string[][] {
 }
 
 /** Start engine/server.py as a child process and wait until /health answers. */
-export async function launchEngine(port: number): Promise<{ client: EngineClient; child: ChildProcess | null }> {
+export async function launchEngine(port: number, token = randomBytes(32).toString('hex')): Promise<{ client: EngineClient; child: ChildProcess | null }> {
   const script = fileURLToPath(new URL('../../engine/server.py', import.meta.url));
-  const client = httpEngine(`http://127.0.0.1:${port}`);
+  const client = httpEngine(`http://127.0.0.1:${port}`, token);
   if (await client.health()) {
-    // An engine from an earlier run is still listening (e.g. the API crashed) - reuse it.
+    // Our own engine from an earlier run is still listening (it knows our token) - reuse it.
     console.log(`[engine] reusing the analytics engine already running on port ${port}`);
     return { client, child: null };
   }
   let lastError = '';
   for (const [cmd, ...args] of pythonCandidates()) {
     const child = spawn(cmd, [...args, script], {
-      env: { ...process.env, ENGINE_PORT: String(port), PYTHONUNBUFFERED: '1' },
+      env: { ...process.env, ENGINE_PORT: String(port), ENGINE_TOKEN: token, PYTHONUNBUFFERED: '1', PYTHONDONTWRITEBYTECODE: '1' },
       stdio: ['ignore', 'inherit', 'inherit'],
       windowsHide: true,
     });

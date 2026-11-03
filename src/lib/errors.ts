@@ -18,5 +18,5 @@ export const notFound = (what: string) => new HttpError(404, 'not_found', `${wha
 export const conflict = (message: string, details?: unknown) => new HttpError(409, 'conflict', message, details);
 export const forbidden = (message = 'You do not have permission for this action') =>
   new HttpError(403, 'forbidden', message);
-export const unauthorized = () => new HttpError(401, 'unauthorized', 'Sign in required (X-User header)');
+export const unauthorized = () => new HttpError(401, 'unauthorized', 'Sign in required');
 export const unavailable = (message: string) => new HttpError(503, 'service_unavailable', message);

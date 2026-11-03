@@ -42,7 +42,7 @@ before(async () => {
   const port = 18000 + Math.floor(Math.random() * 1000);
   const { client, child } = await launchEngine(port);
   kill = () => child?.kill();
-  svc = createServices({ dbPath: ':memory:', engine: client, filesDir: join(dir, 'files'), today: () => TODAY });
+  svc = createServices({ dbPath: ':memory:', engine: client, filesDir: join(dir, 'files'), today: () => TODAY, auth: { mode: 'demo' } });
   seed(svc);
   await seedModules(svc);
   server = createServer(createApp(svc, { log: false }));
@@ -96,7 +96,8 @@ test('funding: role checks, four-eyes, blockers, approval, ledger and idempotenc
   const held = v.invoices.filter((i: any) => i.status === 'HELD').map((i: any) => i.id);
   const untagged = v.invoices.filter((i: any) => i.status === 'PENDING' && !i.investor_id).map((i: any) => i.id);
   assert.equal((await api('POST', `/api/imports/${f.id}/reject`, 'priya', { invoice_ids: held, reason: 'over limit' })).status, 200);
-  assert.equal((await api('POST', `/api/imports/${f.id}/investor`, 'priya', { invoice_ids: untagged, investor_id: 2 })).status, 200);
+  // Investor tagging is the maker's job; a checker who tags is barred from approving (SoD-1).
+  assert.equal((await api('POST', `/api/imports/${f.id}/investor`, 'rabuan', { invoice_ids: untagged, investor_id: 2 })).status, 200);
 
   // Admin uploaded nothing, but the uploader rule is enforced for anyone approving their own file.
   svc.db.run("UPDATE invoice_imports SET uploaded_by = 'admin' WHERE id = ?", [f.id]);
@@ -170,10 +171,33 @@ test('master table: credit can change limits (audited); others cannot', async ()
   const p = (await api('GET', '/api/programs', 'admin')).json.find((x: any) => x.program_code === 'PRG-1041');
   const retail = p.obligors.find((o: any) => o.name === 'Harborview Retail LLC');
   assert.equal((await api('PUT', `/api/obligors/${retail.id}`, 'rabuan', { limit_cents: 1_200_000_000 })).status, 403);
-  const r = await api('PUT', `/api/obligors/${retail.id}`, 'daniel', { limit_cents: 1_200_000_000 });
-  assert.equal(r.status, 200);
+  // A limit change is a request; it does nothing until a second credit user approves it (SoD-5).
+  const r = await api('PUT', `/api/obligors/${retail.id}`, 'daniel', { limit_cents: 1_200_000_000, reason: 'Annual review' });
+  assert.equal(r.status, 202, JSON.stringify(r.json));
+  const crId = r.json.change_request.id;
+  const still = (await api('GET', '/api/programs', 'admin')).json.find((x: any) => x.program_code === 'PRG-1041').obligors.find((o: any) => o.id === retail.id);
+  assert.equal(still.limit_cents, retail.limit_cents);
+  assert.equal((await api('PUT', `/api/obligors/${retail.id}`, 'daniel', { limit_cents: 1_300_000_000 })).status, 409); // one pending change per record
+  assert.equal((await api('POST', `/api/approvals/${crId}/decide`, 'daniel', { decision: 'APPROVE' })).status, 403); // own request
+  assert.equal((await api('POST', `/api/approvals/${crId}/decide`, 'meera', { decision: 'APPROVE' })).status, 403); // wrong role
+  const ok = await api('POST', `/api/approvals/${crId}/decide`, 'sara', { decision: 'APPROVE' });
+  assert.equal(ok.status, 200, JSON.stringify(ok.json));
+  assert.equal((await api('POST', `/api/approvals/${crId}/decide`, 'sara', { decision: 'APPROVE' })).status, 409); // only once
   const log = (await api('GET', `/api/audit?entity_type=obligor&entity_id=${retail.id}`, 'admin')).json;
   assert.deepEqual(log[0].details.changed, ['limit_cents']);
+  assert.equal(log[0].details.requested_by, 'daniel');
+  // Above delegated authority: only the credit committee (ADMIN) can approve.
+  const big = await api('PUT', `/api/obligors/${retail.id}`, 'daniel', { limit_cents: 900_000_000_000 });
+  assert.equal(big.status, 202);
+  assert.equal((await api('POST', `/api/approvals/${big.json.change_request.id}/decide`, 'sara', { decision: 'APPROVE' })).status, 403);
+  assert.equal((await api('POST', `/api/approvals/${big.json.change_request.id}/decide`, 'sara', { decision: 'REJECT', note: 'Above authority' })).status, 200);
+  // FX: Credit can no longer move rates; Treasury requests, a second Treasury/Compliance user approves.
+  assert.equal((await api('POST', '/api/fx', 'daniel', { currency: 'EUR', usd_rate: '0.0001' })).status, 403);
+  const fx = await api('POST', '/api/fx', 'meera', { currency: 'EUR', usd_rate: '1.09' });
+  assert.equal(fx.status, 202);
+  assert.equal((await api('POST', `/api/approvals/${fx.json.change_request.id}/decide`, 'meera', { decision: 'APPROVE' })).status, 403);
+  assert.equal((await api('POST', `/api/approvals/${fx.json.change_request.id}/decide`, 'tom', { decision: 'APPROVE' })).status, 200);
+  assert.equal((await api('GET', '/api/fx', 'admin')).json.find((x: any) => x.currency === 'EUR').usd_rate, '1.09');
 });
 
 test('dashboard aggregates and notifications from the outbox', async () => {
@@ -434,9 +458,11 @@ test('brokerage: pre-trade checks, best execution, confirmations, SoD on settlem
   const ok = await api('POST', '/api/brokerage/orders', 'lucas', { investor_id: inv.id, instrument_id: tbill.id, side: 'BUY', quantity: 40_000_000, order_type: 'MARKET' });
   assert.equal(ok.status, 201, JSON.stringify(ok.json));
   assert.equal(ok.json.status, 'FILLED');
-  assert.ok(ok.json.trades.length >= 2);
+  assert.ok(ok.json.trades.length >= 1);
   const trades = (await api('GET', '/api/brokerage/trades', 'lucas')).json.filter((t: any) => ok.json.trades.includes(t.ref));
   assert.equal(trades.reduce((a: number, t: any) => a + t.quantity, 0), 40_000_000);
+  // The commission tier is set by the whole order (40m -> 8 bps), never per venue fill.
+  assert.ok(trades.every((t: any) => t.commission_bps === 8), JSON.stringify(trades.map((t: any) => t.commission_bps)));
   for (const t of trades) {
     assert.ok(t.confirmation_document_id, 'confirmation PDF generated');
     assert.equal(t.net_cents, t.principal_cents + t.accrued_cents + t.commission_cents + t.venue_fee_cents);

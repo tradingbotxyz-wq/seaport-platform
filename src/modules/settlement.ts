@@ -6,7 +6,7 @@ import type { Services, User } from '../core/context.ts';
 import { requirePermission, now, daysBetween } from '../core/context.ts';
 import * as audit from '../core/audit.ts';
 import { emit } from '../core/outbox.ts';
-import { check } from '../lib/validate.ts';
+import { safeFilename, check } from '../lib/validate.ts';
 import { badRequest, conflict, notFound } from '../lib/errors.ts';
 import { fixingsFor } from './master.ts';
 
@@ -28,6 +28,7 @@ export async function uploadSettlementFile(svc: Services, user: User, body: unkn
   const program = svc.db.get('SELECT * FROM programs WHERE id = ?', [input.program_id]);
   if (!program) throw badRequest('Unknown program');
   if (input.settlement_date > svc.today()) throw badRequest('Settlement (value) date cannot be in the future');
+  input.filename = safeFilename(input.filename);
   const parsed = await svc.engine.parse(input.filename, input.content_base64, 'settlement');
   if (svc.db.get('SELECT id FROM settlement_imports WHERE sha256 = ? AND program_id = ?', [parsed.sha256, program.id])) {
     throw conflict('This exact settlement file has already been uploaded (checksum match)');

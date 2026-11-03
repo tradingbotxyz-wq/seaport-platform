@@ -4,7 +4,7 @@
 import type { Services, User } from '../core/context.ts';
 import { requirePermission, now, addDays } from '../core/context.ts';
 import * as audit from '../core/audit.ts';
-import { check } from '../lib/validate.ts';
+import { safeCell, check } from '../lib/validate.ts';
 import { badRequest, notFound, validation } from '../lib/errors.ts';
 import { fxToUsd } from './exposure.ts';
 import { storeBytes, recordDocument } from './documents.ts';
@@ -151,7 +151,7 @@ export async function exportTable(svc: Services, user: User, title: string, tabl
   let filename: string;
   let contentType: string;
   if (format === 'xlsx') {
-    const r = await svc.engine.call('/export/xlsx', { sheets: [{ name: title.slice(0, 31), columns: table.columns.map((x) => ({ label: x.label, type: x.type })), rows: table.rows.map((row) => table.columns.map((x) => row[x.key])) }] });
+    const r = await svc.engine.call('/export/xlsx', { sheets: [{ name: title.replace(/[\\/?*[\]:]/g, ' ').slice(0, 31), columns: table.columns.map((x) => ({ label: x.label, type: x.type })), rows: table.rows.map((row) => table.columns.map((x) => safeCell(row[x.key]))) }] });
     bytes = Buffer.from(r.content_base64, 'base64');
     filename = `${safe}_${stamp}.xlsx`;
     contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
@@ -165,7 +165,10 @@ export async function exportTable(svc: Services, user: User, title: string, tabl
     filename = `${safe}_${stamp}.pdf`;
     contentType = 'application/pdf';
   } else if (format === 'csv') {
-    const esc = (v: any) => (v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+    const esc = (raw: any) => {
+      const v = safeCell(raw);
+      return v == null ? '' : /[",\r\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
+    };
     bytes = Buffer.from('﻿' + [table.columns.map((x) => esc(x.label)).join(','), ...table.rows.map((row) => table.columns.map((x) => esc(row[x.key])).join(','))].join('\r\n') + '\r\n', 'utf8');
     filename = `${safe}_${stamp}.csv`;
     contentType = 'text/csv';

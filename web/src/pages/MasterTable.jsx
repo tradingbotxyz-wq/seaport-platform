@@ -1,5 +1,5 @@
 import { useState, Fragment } from 'react';
-import { useApi, post, put, navigate, money, moneyShort, pct, bps, advPct, dateShort, toCents, toBps } from '../lib.js';
+import { useApi, post, put, navigate, money, moneyShort, pct, bps, advPct, dateShort, toCents, toBps, doneMessage, isPending } from '../lib.js';
 import { useSession } from '../session.js';
 import { Card, Kpi, Field, Button, Pill, Modal, UsageBar, ErrorBox, Loading, Icon, useUi, useAction } from '../ui.jsx';
 
@@ -167,8 +167,8 @@ function ObligorModal({ obligor, program, onClose, onSaved }) {
   };
   const invalid = !form.name.trim() || [body.limit_cents, body.advance_rate_bps, body.investor_margin_bps, body.sp_spread_bps].some((x) => x === null);
   const save = () => run(async () => {
-    if (obligor) await put(`/api/obligors/${obligor.id}`, body); else await post(`/api/programs/${program.id}/obligors`, body);
-    toast(obligor ? `${form.name} updated` : `${form.name} added to ${program.program_code}`, 'success');
+    const r = obligor ? await put(`/api/obligors/${obligor.id}`, body) : await post(`/api/programs/${program.id}/obligors`, body);
+    toast(doneMessage(r, obligor ? `${form.name} updated` : `${form.name} added to ${program.program_code}`), isPending(r) ? 'info' : 'success');
     onSaved();
   });
   return (
@@ -198,8 +198,8 @@ function ProgramModal({ onClose, onSaved }) {
   const [f, setF] = useState({ program_code: 'PRG-', deal_code: 'SG-WC-', deal_name: '', client_name: '', program_type: 'SCF', currency: 'USD', rate_basis: 'SOFR', day_count: 'ACT/360', funding_lag_days: '1', late_margin: '3.00', collection_account: 'VA-' });
   const set = (k) => (e) => setF((x) => ({ ...x, [k]: e.target.value }));
   const save = () => run(async () => {
-    await post('/api/programs', { ...f, funding_lag_days: Number(f.funding_lag_days), late_margin_bps: toBps(f.late_margin), late_margin: undefined, currency: f.currency.toUpperCase() });
-    toast(`${f.deal_name} created`, 'success');
+    const r = await post('/api/programs', { ...f, funding_lag_days: Number(f.funding_lag_days), late_margin_bps: toBps(f.late_margin), late_margin: undefined, currency: f.currency.toUpperCase() });
+    toast(doneMessage(r, `${f.deal_name} created`), isPending(r) ? 'info' : 'success');
     onSaved();
   });
   return (
@@ -231,8 +231,8 @@ function FixingModal({ onClose, onSaved, latest }) {
   const [rates, setRates] = useState(() => Object.fromEntries(BUCKETS.map((b) => [b, base ? (base.rates[b] / 100).toFixed(2) : ''])));
   const parsed = Object.fromEntries(BUCKETS.map((b) => [b, toBps(rates[b])]));
   const save = () => run(async () => {
-    await post('/api/fixings', { benchmark, fixing_date: date, rates: parsed });
-    toast(`${benchmark} fixing saved for ${dateShort(date)}`, 'success');
+    const r = await post('/api/fixings', { benchmark, fixing_date: date, rates: parsed });
+    toast(doneMessage(r, `${benchmark} fixing saved for ${dateShort(date)}`), isPending(r) ? 'info' : 'success');
     onSaved();
   });
   return (
@@ -286,7 +286,7 @@ function FxCard({ fx }) {
   const { toast } = useUi();
   const [busy, run] = useAction();
   const [edit, setEdit] = useState({});
-  const save = (ccy) => run(async () => { await post('/api/fx', { currency: ccy, usd_rate: edit[ccy] }); toast(`${ccy} rate saved`, 'success'); setEdit((e) => ({ ...e, [ccy]: undefined })); fx.reload(); });
+  const save = (ccy) => run(async () => { const r = await post('/api/fx', { currency: ccy, usd_rate: edit[ccy] }); toast(doneMessage(r, `${ccy} rate saved`), isPending(r) ? 'info' : 'success'); setEdit((e) => ({ ...e, [ccy]: undefined })); fx.reload(); });
   return (
     <Card title="Reference FX" subtitle="Used only to show portfolio totals in USD. Fundings and settlements stay in program currency.">
       {!fx.data ? <Loading /> : (

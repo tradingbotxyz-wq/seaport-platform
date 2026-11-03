@@ -8,10 +8,11 @@
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Services, User } from '../core/context.ts';
+import { assertNotRecentlyReset } from '../core/cooldown.ts';
 import { requirePermission, now, nextRef, addBusinessDays, daysBetween } from '../core/context.ts';
 import * as audit from '../core/audit.ts';
 import { emit } from '../core/outbox.ts';
-import { check } from '../lib/validate.ts';
+import { safeFilename, check } from '../lib/validate.ts';
 import { badRequest, conflict, forbidden, notFound } from '../lib/errors.ts';
 import { currentUtilisation, pipeline, purchasePrice, limitStatus, pct } from './exposure.ts';
 import { fixingsFor } from './master.ts';
@@ -44,6 +45,7 @@ export async function uploadInvoiceFile(svc: Services, user: User, body: unknown
     throw badRequest(`Funding date must be on or after ${earliest} (T+${program.funding_lag_days} from upload). Same-day funding is not permitted.`);
   }
 
+  input.filename = safeFilename(input.filename);
   const parsed = await svc.engine.parse(input.filename, input.content_base64, 'invoice');
   if (svc.db.get("SELECT id FROM invoice_imports WHERE sha256 = ? AND program_id = ? AND status <> 'REMOVED'", [parsed.sha256, program.id])) {
     throw conflict('This exact file has already been uploaded to this program (checksum match)');
@@ -297,6 +299,27 @@ export function recheck(svc: Services, user: User, importId: number) {
   });
 }
 
+/**
+ * Record a change to a file under review. `content` changes (restore, investor tagging, funding date)
+ * disqualify that user from approving the file (SoD-1); every change bumps the version so an approval
+ * that started before it is refused.
+ */
+function touch(svc: Services, importId: number, user: User, content: boolean) {
+  const f = svc.db.get<any>('SELECT modified_by FROM invoice_imports WHERE id = ?', [importId])!;
+  const by: string[] = JSON.parse(f.modified_by || '[]');
+  if (content && !by.includes(user.username)) by.push(user.username);
+  svc.db.run('UPDATE invoice_imports SET version = version + 1, modified_by = ? WHERE id = ?', [JSON.stringify(by), importId]);
+}
+
+/** Everything approval prices from: version, funding date, invoices and investors, obligor pricing, fixings. */
+function fundingFingerprint(svc: Services, importId: number) {
+  const f = svc.db.get<any>('SELECT i.version, i.funding_date, p.rate_basis FROM invoice_imports i JOIN programs p ON p.id = i.program_id WHERE i.id = ?', [importId])!;
+  const inv = svc.db.all(`SELECT i.id, i.status, i.investor_id, i.face_cents, i.due_date, o.advance_rate_bps, o.investor_margin_bps, o.sp_spread_bps, o.limit_cents
+    FROM invoices i LEFT JOIN obligors o ON o.id = i.obligor_id WHERE i.import_id = ? AND i.status IN ('PENDING','HELD') ORDER BY i.id`, [importId]);
+  const fx = fixingsFor(svc, f.rate_basis, f.funding_date);
+  return JSON.stringify([f.version, f.funding_date, inv, fx]);
+}
+
 export function rejectInvoices(svc: Services, user: User, importId: number, body: any) {
   requirePermission(user, 'invoices.review');
   const list = ids(body);
@@ -309,6 +332,7 @@ export function rejectInvoices(svc: Services, user: User, importId: number, body
         [`${USER_REJECT}${user.name}: ${reason}`, now(), invId, importId]).changes;
     }
     applyLimitHolds(svc, importId);
+    touch(svc, importId, user, false);
     const c = refreshCounts(svc, importId);
     audit.record(svc.db, user, 'invoices.rejected', 'invoice_import', importId, { invoice_ids: list, reason, changed: n });
     return { ok: true, changed: n, ...c };
@@ -331,6 +355,7 @@ export function restoreInvoices(svc: Services, user: User, importId: number, bod
       n += svc.db.run("UPDATE invoices SET status = 'PENDING', status_reason = NULL, updated_at = ? WHERE id = ?", [now(), invId]).changes;
     }
     applyLimitHolds(svc, importId);
+    if (n) touch(svc, importId, user, true);
     const c = refreshCounts(svc, importId);
     audit.record(svc.db, user, 'invoices.restored', 'invoice_import', importId, { invoice_ids: list, changed: n, skipped });
     return { ok: true, changed: n, skipped, ...c };
@@ -348,6 +373,7 @@ export function tagInvestor(svc: Services, user: User, importId: number, body: a
     for (const invId of list) {
       n += svc.db.run("UPDATE invoices SET investor_id = ?, updated_at = ? WHERE id = ? AND import_id = ? AND status IN ('PENDING','HELD')", [investorId, now(), invId, importId]).changes;
     }
+    if (n) touch(svc, importId, user, true);
     audit.record(svc.db, user, 'invoices.investor_tagged', 'invoice_import', importId, { invoice_ids: list, investor_id: investorId });
     return { ok: true, changed: n };
   });
@@ -368,6 +394,7 @@ export function changeFundingDate(svc: Services, user: User, importId: number, b
       [now(), importId, funding_date]);
     applyLimitHolds(svc, importId);
     refreshCounts(svc, importId);
+    touch(svc, importId, user, true);
     audit.record(svc.db, user, 'invoice_import.funding_date_changed', 'invoice_import', importId, { from: f.funding_date, to: funding_date });
     return getImport(svc, importId);
   });
@@ -389,8 +416,12 @@ export function removeImport(svc: Services, user: User, importId: number, body: 
 
 export async function approveFunding(svc: Services, user: User, importId: number) {
   requirePermission(user, 'funding.approve');
+  assertNotRecentlyReset(svc, user);
+  const before = fundingFingerprint(svc, importId);
   const view = await fundingView(svc, user, importId);
   if (view.import.uploaded_by === user.username) throw forbidden('Four-eyes: the approver must differ from the uploader');
+  const editors: string[] = JSON.parse(svc.db.get<any>('SELECT modified_by FROM invoice_imports WHERE id = ?', [importId])!.modified_by || '[]');
+  if (editors.includes(user.username)) throw forbidden('Four-eyes (SoD-1): you restored invoices, tagged investors or changed the funding date on this file, so another checker must approve it');
   if (view.blockers.length) throw conflict('Funding cannot be approved', view.blockers.map((b) => b.message));
   const f = view.import;
   const pending = view.invoices.filter((r: any) => r.status === 'PENDING');
@@ -399,7 +430,7 @@ export async function approveFunding(svc: Services, user: User, importId: number
   return svc.db.tx(() => {
     // Re-verify inside the transaction: nothing changed since pricing, and limits still hold.
     const nowPending = svc.db.all<{ id: number }>("SELECT id FROM invoices WHERE import_id = ? AND status = 'PENDING' ORDER BY id", [importId]).map((r) => r.id).join(',');
-    if (nowPending !== snapshot) throw conflict('The batch changed while you were reviewing it - reload and try again');
+    if (nowPending !== snapshot || fundingFingerprint(svc, importId) !== before) throw conflict('The batch, its pricing inputs or its funding date changed while it was being approved - reload and try again');
     applyLimitHolds(svc, importId);
     if (svc.db.get("SELECT id FROM invoices WHERE import_id = ? AND status = 'HELD'", [importId])) throw conflict('Limit position changed - invoices are now held; reload and review');
     const status = svc.db.run("UPDATE invoice_imports SET status = 'APPROVED', approved_by = ?, approved_at = ? WHERE id = ? AND status = 'UPLOADED'", [user.username, now(), importId]);

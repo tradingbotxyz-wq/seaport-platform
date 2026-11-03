@@ -101,8 +101,18 @@ export function Button({ variant = '', size, icon, children, className = '', ...
 }
 
 /** Label + control. The label is linked to the first form control (id/htmlFor) and the hint via aria-describedby. */
-export function Field({ label, hint, children, style, hideLabel }) {
+export function Field({ label, hint, children, style, hideLabel, htmlFor }) {
   const auto = useId();
+  if (htmlFor) {
+    // The control is nested (e.g. inside a wrapper with a show/hide button): label it by id.
+    return (
+      <div className="field" style={style}>
+        {label && <label htmlFor={htmlFor} className={hideLabel ? 'sr-only' : undefined}>{label}</label>}
+        {children}
+        {hint && <div className="hint" id={`${htmlFor}-hint`}>{hint}</div>}
+      </div>
+    );
+  }
   const kids = Children.toArray(children);
   const first = kids[0];
   const isControl = isValidElement(first) && ['input', 'select', 'textarea'].includes(first.type);

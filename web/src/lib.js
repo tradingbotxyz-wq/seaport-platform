@@ -2,8 +2,12 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 
 // ---------- API ----------
+// Demo mode only: the picked user travels in X-User. With password sign-in the session is an
+// HttpOnly cookie the browser sends itself; scripts never see it.
 let currentUser = '';
 export const setApiUser = (u) => { currentUser = u || ''; };
+let lastActivity = Date.now();
+export const lastApiActivity = () => lastActivity;
 
 export class ApiError extends Error {
   constructor(status, body) {
@@ -17,24 +21,35 @@ export class ApiError extends Error {
 const uuid = () => (globalThis.crypto?.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
 
 export async function api(path, { method = 'GET', body, idempotent = false } = {}) {
-  const headers = { 'X-User': currentUser };
+  const headers = { 'X-Requested-With': 'seaport' }; // CSRF guard: cross-site forms cannot send custom headers
+  if (currentUser) headers['X-User'] = currentUser;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (idempotent) headers['Idempotency-Key'] = uuid();
   let res;
   try {
-    res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    res = await fetch(path, { method, headers, credentials: 'same-origin', body: body === undefined ? undefined : JSON.stringify(body) });
   } catch {
-    throw new ApiError(0, { error: { message: 'Cannot reach the server. Is "npm start" still running?' } });
+    throw new ApiError(0, { error: { message: 'Cannot reach the server. Check your connection and try again.' } });
   }
+  lastActivity = Date.now();
   const text = await res.text();
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch { json = text; }
-  if (!res.ok) throw new ApiError(res.status, json);
+  if (!res.ok) {
+    if ((res.status === 401 && !path.startsWith('/api/auth/')) || (res.status === 403 && json?.error?.code === 'session_incomplete')) {
+      window.dispatchEvent(new CustomEvent('sg:signed-out', { detail: { reason: res.status === 401 ? 'expired' : 'incomplete' } }));
+    }
+    throw new ApiError(res.status, json);
+  }
   return json;
 }
 export const get = (p) => api(p);
 export const post = (p, body = {}, opts = {}) => api(p, { method: 'POST', body, ...opts });
 export const put = (p, body = {}) => api(p, { method: 'PUT', body });
+
+/** Changes to reference data, bank details and access come back as "submitted for approval" (HTTP 202). */
+export const isPending = (r) => !!r?.pending_approval;
+export const doneMessage = (r, saved) => (isPending(r) ? r.message : saved);
 
 export function fileToBase64(file) {
   return new Promise((resolve, reject) => {

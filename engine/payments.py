@@ -49,6 +49,19 @@ def _alnum(s, n, upper=True):
     return s[:n].ljust(n)
 
 
+def _swift_x(s, n):
+    """SWIFT 'x' character set only (letters, digits, / - ? : ( ) . , ' + space); no line breaks or braces."""
+    s = re.sub(r"[^A-Za-z0-9/\-?().,'+ ]", "", str(s or "").replace("\r", " ").replace("\n", " "))
+    s = s.replace(":", "")  # a leading colon would start a new field
+    return s[:n].strip() or "NOTPROVIDED"
+
+
+def _ref(s, n=16):
+    """Transaction reference: letters, digits and - only; never starts or ends with / (SWIFT :20: rules)."""
+    s = re.sub(r"[^A-Za-z0-9-]", "", str(s or ""))[:n]
+    return s or "REF"
+
+
 def _num(v, n):
     return str(int(v)).rjust(n, "0")[-n:]
 
@@ -66,8 +79,8 @@ def validate(rail: str, body: dict) -> list[str]:
     else:
         if not BIC_RE.match(o.get("bic") or ""):
             errors.append("Originator BIC is invalid")
-        if not iban_valid(o.get("iban")) and not o.get("account_number"):
-            errors.append("Originator IBAN/account is invalid")
+        if not iban_valid(o.get("iban")):
+            errors.append("Originator IBAN is invalid or missing (required for SWIFT MT103 and pain.001)")
     pays = body.get("payments") or []
     if not pays:
         errors.append("No payments in batch")
@@ -162,10 +175,10 @@ def mt103(body: dict) -> str:
         sender = (o["bic"] + "XXX")[:8] + "A" + (o["bic"] + "XXX")[8:11]
         out.append(
             "{1:F01" + sender + "0000000000}{2:I103" + (b["bic"] + "XXX")[:8] + "X" + (b["bic"] + "XXX")[8:11] + "N}{4:\r\n"
-            + f":20:{p['reference'][:16]}\r\n:23B:CRED\r\n:32A:{vd}{body['currency']}{_swift_amount(p['amount_cents'])}\r\n"
-            + f":50K:/{(o.get('iban') or o.get('account_number')).replace(' ', '')}\r\n{_alnum(o['name'], 35, False).rstrip()}\r\n"
-            + f":57A:{b['bic']}\r\n:59:/{b['iban'].replace(' ', '')}\r\n{_alnum(b['name'], 35, False).rstrip()}\r\n"
-            + f":70:{_alnum(p.get('remittance') or p['reference'], 35, False).rstrip()}\r\n:71A:SHA\r\n-}}")
+            + f":20:{_ref(p['reference'])}\r\n:23B:CRED\r\n:32A:{vd}{body['currency']}{_swift_amount(p['amount_cents'])}\r\n"
+            + f":50K:/{o['iban'].replace(' ', '')}\r\n{_swift_x(o['name'], 35)}\r\n"
+            + f":57A:{b['bic']}\r\n:59:/{b['iban'].replace(' ', '')}\r\n{_swift_x(b['name'], 35)}\r\n"
+            + f":70:{_swift_x(p.get('remittance') or p['reference'], 35)}\r\n:71A:SHA\r\n-}}")
     return "\r\n".join(out) + "\r\n"
 
 
@@ -177,12 +190,12 @@ def pain001(body: dict) -> str:
     for p in body["payments"]:
         b = p["beneficiary"]
         tx.append(f"""      <CdtTrfTxInf>
-        <PmtId><EndToEndId>{escape(p['reference'][:35])}</EndToEndId></PmtId>
+        <PmtId><EndToEndId>{_ref(p['reference'], 35)}</EndToEndId></PmtId>
         <Amt><InstdAmt Ccy="{body['currency']}">{amt(p['amount_cents'])}</InstdAmt></Amt>
         <CdtrAgt><FinInstnId><BIC>{b['bic']}</BIC></FinInstnId></CdtrAgt>
-        <Cdtr><Nm>{escape(b['name'][:70])}</Nm></Cdtr>
+        <Cdtr><Nm>{escape(_swift_x(b['name'], 70))}</Nm></Cdtr>
         <CdtrAcct><Id><IBAN>{b['iban'].replace(' ', '')}</IBAN></Id></CdtrAcct>
-        <RmtInf><Ustrd>{escape((p.get('remittance') or p['reference'])[:140])}</Ustrd></RmtInf>
+        <RmtInf><Ustrd>{escape(_swift_x(p.get('remittance') or p['reference'], 140))}</Ustrd></RmtInf>
       </CdtTrfTxInf>""")
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Document xmlns="urn:iso:std:iso:20022:tech:xsd:pain.001.001.03">
