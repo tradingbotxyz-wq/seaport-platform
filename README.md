@@ -10,6 +10,8 @@ A runnable MVP of the Seaport Global working-capital / receivables-finance platf
 
 No `npm install` or `pip install` is needed to run it. Everything uses built-in Node.js and Python features, and the React UI ships pre-built.
 
+> **New laptop or server?** See [docs/SETUP_AND_DEPLOYMENT.md](docs/SETUP_AND_DEPLOYMENT.md) for step-by-step setup on Windows/macOS/Linux and deployment on AWS (EC2, Docker, target production architecture).
+
 ## Requirements
 
 * **Node.js 22.18 or newer** (you have 26 ✔)
@@ -43,7 +45,7 @@ Then open **http://localhost:3000**. The first start loads demo data, with dates
 | `npm run test:engine` | Python unit tests (pricing, parsing) |
 | `npm run build:web` | Rebuild the React UI after editing `web/src` (see below) |
 
-Settings (environment variables): `PORT` (3000), `ENGINE_PORT` (8001), `DB_PATH` (`data/seaport.db`), `BUSINESS_DATE` (override "today", e.g. `2026-09-21`), `PYTHON` (path to python.exe if it is not on PATH).
+Settings (environment variables): `PORT` (3000), `HOST` (127.0.0.1), `ENGINE_PORT` (8001), `DB_PATH` (`data/seaport.db`), `FILES_DIR` (`data/files`), `BUSINESS_DATE` (override "today", e.g. `2026-09-21`), `PYTHON` (path to python.exe if it is not on PATH).
 
 ## Demo users (local sign-in)
 

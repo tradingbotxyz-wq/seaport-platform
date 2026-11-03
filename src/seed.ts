@@ -326,13 +326,13 @@ if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith
   const dbPath = process.env.DB_PATH ?? join(ROOT, 'data', 'seaport.db');
   if (process.argv.includes('--reset')) {
     for (const f of [dbPath, dbPath + '-wal', dbPath + '-shm']) if (existsSync(f)) rmSync(f);
-    rmSync(join(ROOT, 'data', 'files'), { recursive: true, force: true });
+    rmSync(process.env.FILES_DIR ?? join(ROOT, 'data', 'files'), { recursive: true, force: true });
     console.log('Database and files deleted.');
   }
   const { launchEngine } = await import('./integrations/engine.ts');
   const { seedModules } = await import('./seed-modules.ts');
   const { client, child } = await launchEngine(Number(process.env.ENGINE_PORT ?? 8001));
-  const svc = createServices({ dbPath, engine: client, filesDir: join(ROOT, 'data', 'files') });
+  const svc = createServices({ dbPath, engine: client, filesDir: process.env.FILES_DIR ?? join(ROOT, 'data', 'files') });
   if (svc.db.get<{ n: number }>('SELECT COUNT(*) n FROM users')!.n) {
     console.log('Database already has data. Use "npm run reset" to start over.');
   } else {

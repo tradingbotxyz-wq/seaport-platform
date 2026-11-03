@@ -1,0 +1,34 @@
+# systemd unit for the Seaport platform on an EC2 instance.
+# Installed by deploy/aws-ec2/install.sh to /etc/systemd/system/seaport.service
+[Unit]
+Description=Seaport Global platform (Node API + React UI + Python engine)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=seaport
+Group=seaport
+WorkingDirectory=/opt/seaport-platform
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=3000
+Environment=ENGINE_PORT=8001
+Environment=PYTHON=python3
+Environment=DB_PATH=/var/lib/seaport/seaport.db
+Environment=FILES_DIR=/var/lib/seaport/files
+# Business date follows the firm's time zone (change if needed).
+Environment=TZ=America/New_York
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/node --disable-warning=ExperimentalWarning src/server.ts
+Restart=on-failure
+RestartSec=5
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/seaport
+
+[Install]
+WantedBy=multi-user.target

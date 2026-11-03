@@ -1,0 +1,10 @@
+.git
+data
+node_modules
+web/node_modules
+**/__pycache__
+*.pyc
+public/app.js.map
+test
+docs
+deploy

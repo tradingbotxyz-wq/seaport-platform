@@ -3,6 +3,8 @@
 //   ENGINE_PORT (default 8001)   Python engine port (local only)
 //   ENGINE_URL  optional         use an already-running engine instead of launching one
 //   DB_PATH     (default data/seaport.db)
+//   FILES_DIR   (default data/files)          uploaded and generated documents
+//   HOST        (default 127.0.0.1)           0.0.0.0 inside a container / behind a load balancer
 
 import { createServer } from 'node:http';
 import { join } from 'node:path';
@@ -11,6 +13,7 @@ import { httpEngine, launchEngine } from './integrations/engine.ts';
 import { startDispatcher } from './core/outbox.ts';
 
 const port = Number(process.env.PORT ?? 3000);
+const host = process.env.HOST ?? '127.0.0.1';
 const enginePort = Number(process.env.ENGINE_PORT ?? 8001);
 
 let engineChild: { kill: () => void } | null = null;
@@ -31,7 +34,7 @@ if (process.env.ENGINE_URL) {
 const services = createServices({
   dbPath: process.env.DB_PATH ?? join(ROOT, 'data', 'seaport.db'),
   engine,
-  filesDir: join(ROOT, 'data', 'files'),
+  filesDir: process.env.FILES_DIR ?? join(ROOT, 'data', 'files'),
 });
 
 const count = services.db.get<{ n: number }>('SELECT COUNT(*) n FROM users')!.n;
@@ -51,7 +54,7 @@ const runSweep = () => { try { snapshotMonthEnds(services); } catch (e: any) { c
 await runSweep();
 setInterval(runSweep, 3600e3).unref();
 const server = createServer(createApp(services));
-server.listen(port, '127.0.0.1', () => {
+server.listen(port, host, () => {
   console.log(`\n  Seaport Global - Working Capital platform`);
   console.log(`  Open http://localhost:${port}   (business date ${services.today()})\n`);
 });
