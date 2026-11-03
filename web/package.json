@@ -1,0 +1,13 @@
+{
+  "name": "seaport-web",
+  "private": true,
+  "description": "React UI source. Only needed if you want to change the screens: run `npm install` here, then `npm run build:web` from the project root.",
+  "type": "module",
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

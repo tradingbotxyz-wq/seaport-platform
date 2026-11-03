@@ -1,0 +1,19 @@
+{
+  "name": "seaport-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Seaport Global Working Capital platform - React UI, Node.js API, Python analytics engine",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.ts",
+    "seed": "node --disable-warning=ExperimentalWarning src/seed.ts",
+    "reset": "node --disable-warning=ExperimentalWarning src/seed.ts --reset",
+    "test": "node --disable-warning=ExperimentalWarning --test --test-reporter=spec test/api.test.ts",
+    "test:engine": "python -m unittest discover -s engine/tests -v",
+    "build:web": "node web/build.mjs",
+    "dev:web": "node web/build.mjs --watch"
+  }
+}
